@@ -1,7 +1,12 @@
 import requests
 import json
 import re
+import logging
 from typing import List, Dict, Any, Optional
+
+# 配置日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class LLMEnhancer:
     def __init__(self, api_key: str, base_url: str = "https://api.deepseek.com"):
@@ -15,7 +20,7 @@ class LLMEnhancer:
     def call_llm(self, prompt: str, max_tokens: int = 2000) -> Optional[str]:
         """调用DeepSeek LLM API"""
         url = f"{self.base_url}/chat/completions"
-        
+
         payload = {
             "model": "deepseek-chat",
             "messages": [
@@ -24,24 +29,51 @@ class LLMEnhancer:
                     "content": "你是一个专业的表格数据处理助手，擅长纠正OCR识别错误、完善表格结构、标准化数据格式。请严格按照JSON格式返回结果。"
                 },
                 {
-                    "role": "user", 
+                    "role": "user",
                     "content": prompt
                 }
             ],
             "max_tokens": max_tokens,
             "temperature": 0.1
         }
-        
+
         try:
-            response = requests.post(url, headers=self.headers, json=payload, timeout=30)
+            logger.info(f"正在调用LLM API: {url}")
+            logger.info(f"请求payload大小: {len(json.dumps(payload))} 字符")
+            # 增加超时时间到120秒，因为大表格处理需要更长时间
+            response = requests.post(url, headers=self.headers, json=payload, timeout=120)
+
+            logger.info(f"LLM API响应状态码: {response.status_code}")
+
             if response.status_code == 200:
                 result = response.json()
-                return result["choices"][0]["message"]["content"]
+                logger.info(f"API响应结构: {list(result.keys())}")
+                if "choices" in result and len(result["choices"]) > 0:
+                    content = result["choices"][0]["message"]["content"]
+                    logger.info(f"LLM API调用成功，返回内容长度: {len(content)} 字符")
+                    logger.info(f"返回内容预览: {content[:200]}...")
+                    return content
+                else:
+                    logger.error(f"API响应格式异常，没有choices字段: {result}")
+                    return None
             else:
-                print(f"LLM API调用失败: {response.status_code} - {response.text}")
+                error_msg = f"LLM API调用失败: {response.status_code} - {response.text}"
+                logger.error(error_msg)
+                # 返回错误信息而不是None，以便调用者可以看到具体错误
                 return None
+        except requests.exceptions.Timeout:
+            error_msg = "LLM API调用超时"
+            logger.error(error_msg)
+            return None
+        except requests.exceptions.ConnectionError as e:
+            error_msg = f"LLM API连接失败: {e}"
+            logger.error(error_msg)
+            return None
         except Exception as e:
-            print(f"LLM调用异常: {e}")
+            error_msg = f"LLM调用异常: {e}"
+            logger.error(error_msg)
+            import traceback
+            logger.error(f"详细错误信息: {traceback.format_exc()}")
             return None
     
     def enhance_table_data(self, table_data: List[List[str]], original_ocr_result: Dict) -> Dict[str, Any]:
@@ -84,6 +116,8 @@ class LLMEnhancer:
         
         llm_response = self.call_llm(prompt)
         if not llm_response:
+            error_detail = "LLM API调用失败，请检查网络连接和API密钥"
+            logger.error(f"LLM增强失败: {error_detail}")
             return {
                 "enhanced_table": table_data,
                 "corrections": [],
@@ -92,7 +126,7 @@ class LLMEnhancer:
                     "data_types": [],
                     "estimated_columns": len(table_data[0]) if table_data else 0
                 },
-                "error": "LLM调用失败"
+                "error": error_detail
             }
         
         # 解析LLM响应
