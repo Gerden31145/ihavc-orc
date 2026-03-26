@@ -38,23 +38,64 @@
         </div>
       </div>
 
-      <button
-        v-if="previewImage && !isLoading"
-        @click="startOcr"
-        class="ocr-btn"
-        :disabled="isLoading"
-      >
-        开始识别
-      </button>
+      <div v-if="previewImage && !isLoading" class="ocr-controls">
+        <div class="llm-toggle">
+          <label class="toggle-label">
+            <input type="checkbox" v-model="useLLMEnhancement" />
+            <span class="toggle-slider"></span>
+            <span class="toggle-text">启用LLM智能增强</span>
+          </label>
+          <span class="toggle-hint">使用AI纠正识别错误，完善表格结构</span>
+        </div>
+        
+        <button
+          @click="startOcr"
+          class="ocr-btn"
+          :disabled="isLoading"
+        >
+          {{ useLLMEnhancement ? '智能识别' : '开始识别' }}
+        </button>
+      </div>
     </div>
 
     <div v-if="errorMessage" class="error-message">
       {{ errorMessage }}
     </div>
 
+    <!-- 增强信息显示 -->
+    <div v-if="enhancementInfo.applied" class="enhancement-section">
+      <div class="enhancement-header">
+        <h3>🔍 AI智能增强结果</h3>
+        <span class="enhancement-badge">AI优化</span>
+      </div>
+      
+      <div v-if="enhancementInfo.corrections.length > 0" class="corrections-list">
+        <h4>文字纠正 ({{ enhancementInfo.corrections.length }} 处)</h4>
+        <div class="correction-item" v-for="(correction, index) in enhancementInfo.corrections" :key="index">
+          <span class="original">{{ correction.original }}</span>
+          <span class="arrow">→</span>
+          <span class="corrected">{{ correction.corrected }}</span>
+          <span class="reason">{{ correction.reason }}</span>
+        </div>
+      </div>
+      
+      <div v-if="enhancementInfo.tableStructure && Object.keys(enhancementInfo.tableStructure).length > 0" class="structure-info">
+        <h4>表格结构分析</h4>
+        <div class="structure-details">
+          <span>表头: {{ enhancementInfo.tableStructure.headers ? enhancementInfo.tableStructure.headers.join(', ') : '未识别' }}</span>
+          <span>列数: {{ enhancementInfo.tableStructure.estimated_columns ?? '未知' }}</span>
+          <span>数据类型: {{ enhancementInfo.tableStructure.data_types ? enhancementInfo.tableStructure.data_types.join(', ') : '未分析' }}</span>
+        </div>
+      </div>
+      
+      <div v-if="enhancementInfo.error" class="enhancement-error">
+        <span class="error-text">⚠️ 增强过程遇到问题: {{ enhancementInfo.error }}</span>
+      </div>
+    </div>
+
     <div v-if="tableData.headers.length > 0" class="table-section">
       <div class="table-header">
-        <h3>识别结果</h3>
+        <h3>{{ enhancementInfo.applied ? '智能识别结果' : '识别结果' }}</h3>
         <div class="table-actions">
           <button @click="exportCsv" class="export-btn">导出 CSV</button>
         </div>
@@ -81,6 +122,7 @@
 
       <div class="table-info">
         <span>共 {{ tableData.rows.length }} 行数据</span>
+        <span v-if="enhancementInfo.applied" class="enhancement-indicator">✓ AI增强已应用</span>
       </div>
     </div>
   </div>
@@ -100,10 +142,30 @@ const previewImage = ref('')
 const errorMessage = ref('')
 const fileInput = ref<HTMLInputElement>()
 const selectedFile = ref<File | null>(null)
+const useLLMEnhancement = ref(true)
 
 const tableData = reactive<TableData>({
   headers: [],
   rows: []
+})
+
+interface Correction {
+  original: string
+  corrected: string
+  reason: string
+}
+
+interface TableStructure {
+  headers?: string[]
+  data_types?: string[]
+  estimated_columns?: number
+}
+
+const enhancementInfo = reactive({
+  applied: false,
+  corrections: [] as Correction[],
+  tableStructure: {} as TableStructure,
+  error: ''
 })
 
 // 触发文件选择
@@ -155,6 +217,12 @@ const clearImage = () => {
   tableData.headers = []
   tableData.rows = []
   errorMessage.value = ''
+  
+  // 重置增强信息
+  enhancementInfo.applied = false
+  enhancementInfo.corrections = []
+  enhancementInfo.tableStructure = {}
+  enhancementInfo.error = ''
 }
 
 // 开始OCR识别
@@ -166,12 +234,21 @@ const startOcr = async () => {
 
   isLoading.value = true
   errorMessage.value = ''
+  
+  // 重置增强信息
+  enhancementInfo.applied = false
+  enhancementInfo.corrections = []
+  enhancementInfo.tableStructure = {}
+  enhancementInfo.error = ''
 
   try {
     const formData = new FormData()
     formData.append('file', selectedFile.value)
 
-    const response = await fetch('http://localhost:8000/api/ocr', {
+    // 添加LLM增强参数
+    const url = `http://localhost:8000/api/ocr?enhance=${useLLMEnhancement.value}`
+    
+    const response = await fetch(url, {
       method: 'POST',
       body: formData
     })
@@ -181,6 +258,14 @@ const startOcr = async () => {
     if (result.success) {
       tableData.headers = result.data.headers
       tableData.rows = result.data.rows
+      
+      // 保存增强信息
+      if (result.enhancement) {
+        enhancementInfo.applied = result.enhancement.applied
+        enhancementInfo.corrections = result.enhancement.corrections || []
+        enhancementInfo.tableStructure = result.enhancement.tableStructure || {}
+        enhancementInfo.error = result.enhancement.error || ''
+      }
     } else {
       errorMessage.value = result.error || '识别失败，请重试'
     }
@@ -194,11 +279,11 @@ const startOcr = async () => {
 
 // 导出CSV
 const exportCsv = () => {
-  if (tableData.headers.length === 0) return
+  if (!tableData.headers || tableData.headers.length === 0) return
 
   const csvContent = [
     tableData.headers.join(','),
-    ...tableData.rows.map(row => row.join(','))
+    ...tableData.rows.map(row => row ? row.join(',') : '')
   ].join('\n')
 
   const blob = new Blob(['\ufeff' + csvContent], { type: 'text/csv;charset=utf-8;' })
@@ -420,6 +505,174 @@ const exportCsv = () => {
   padding: 0.75rem 1.5rem;
   background: #f5f5f5;
   color: #666;
+  font-size: 0.9rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.enhancement-indicator {
+  color: #4CAF50;
+  font-weight: 600;
+}
+
+/* LLM增强控制样式 */
+.ocr-controls {
+  margin-top: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.llm-toggle {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.toggle-label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.toggle-label input[type="checkbox"] {
+  display: none;
+}
+
+.toggle-slider {
+  width: 50px;
+  height: 24px;
+  background: #ccc;
+  border-radius: 24px;
+  position: relative;
+  transition: background 0.3s;
+}
+
+.toggle-slider::before {
+  content: '';
+  position: absolute;
+  width: 20px;
+  height: 20px;
+  background: white;
+  border-radius: 50%;
+  top: 2px;
+  left: 2px;
+  transition: transform 0.3s;
+}
+
+.toggle-label input[type="checkbox"]:checked + .toggle-slider {
+  background: #4CAF50;
+}
+
+.toggle-label input[type="checkbox"]:checked + .toggle-slider::before {
+  transform: translateX(26px);
+}
+
+.toggle-text {
+  color: #333;
+}
+
+.toggle-hint {
+  font-size: 0.85rem;
+  color: #666;
+  margin-left: 60px;
+}
+
+/* 增强信息显示样式 */
+.enhancement-section {
+  background: linear-gradient(135deg, #e8f5e8, #f0f8f0);
+  border: 1px solid #4CAF50;
+  border-radius: 8px;
+  padding: 1.5rem;
+  margin-bottom: 2rem;
+}
+
+.enhancement-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1rem;
+}
+
+.enhancement-header h3 {
+  margin: 0;
+  color: #2e7d32;
+}
+
+.enhancement-badge {
+  background: #4CAF50;
+  color: white;
+  padding: 0.25rem 0.75rem;
+  border-radius: 12px;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.corrections-list h4,
+.structure-info h4 {
+  margin: 1rem 0 0.5rem 0;
+  color: #2e7d32;
+  font-size: 1rem;
+}
+
+.correction-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem;
+  background: white;
+  border-radius: 4px;
+  margin-bottom: 0.25rem;
+  border-left: 3px solid #4CAF50;
+}
+
+.original {
+  text-decoration: line-through;
+  color: #f44336;
+  font-weight: 500;
+}
+
+.arrow {
+  color: #666;
+}
+
+.corrected {
+  color: #4CAF50;
+  font-weight: 600;
+}
+
+.reason {
+  color: #666;
+  font-size: 0.85rem;
+  margin-left: auto;
+}
+
+.structure-details {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.structure-details span {
+  background: white;
+  padding: 0.5rem;
+  border-radius: 4px;
+  font-size: 0.9rem;
+}
+
+.enhancement-error {
+  background: #ffebee;
+  border: 1px solid #f44336;
+  border-radius: 4px;
+  padding: 0.75rem;
+  margin-top: 1rem;
+}
+
+.error-text {
+  color: #c62828;
   font-size: 0.9rem;
 }
 </style>

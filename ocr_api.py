@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import base64
 import requests
 import uvicorn
+from llm_enhancer import LLMEnhancer
 
 app = FastAPI(title="高考分数线OCR服务")
 
@@ -18,6 +19,12 @@ app.add_middleware(
 # 百度云API信息
 API_KEY = "oRirY5AYCHC7giulzzLj4jFV"
 SECRET_KEY = "OHkKy4zC8rSKulma0XQOQ04mn1RACtfl"
+
+# DeepSeek LLM API信息
+DEEPSEEK_API_KEY = "sk-d114b6faaa5942969eaaba903080c713"
+
+# 初始化LLM增强器
+llm_enhancer = LLMEnhancer(api_key=DEEPSEEK_API_KEY)
 
 
 def get_access_token():
@@ -108,9 +115,9 @@ def process_table_data(tables_result):
 
 
 @app.post("/api/ocr")
-async def ocr_table(file: UploadFile = File(...)):
+async def ocr_table(file: UploadFile = File(...), enhance: bool = True):
     """
-    OCR识别表格图片
+    OCR识别表格图片，可选择是否使用LLM增强
     """
     # 验证文件类型
     if not file.content_type.startswith('image/'):
@@ -142,13 +149,55 @@ async def ocr_table(file: UploadFile = File(...)):
             data_matrix = process_table_data(result["tables_result"])
 
             if data_matrix:
-                return {
-                    "success": True,
-                    "data": {
-                        "headers": data_matrix[0] if data_matrix else [],
-                        "rows": data_matrix[1:] if len(data_matrix) > 1 else []
+                # 如果启用LLM增强
+                if enhance:
+                    try:
+                        enhanced_result = llm_enhancer.enhance_table_data(data_matrix, result)
+                        
+                        # 使用增强后的表格数据
+                        enhanced_table = enhanced_result.get("enhanced_table", data_matrix)
+                        
+                        return {
+                            "success": True,
+                            "data": {
+                                "headers": enhanced_table[0] if enhanced_table else [],
+                                "rows": enhanced_table[1:] if len(enhanced_table) > 1 else [],
+                                "original_headers": data_matrix[0] if data_matrix else [],
+                                "original_rows": data_matrix[1:] if len(data_matrix) > 1 else []
+                            },
+                            "enhancement": {
+                                "applied": True,
+                                "corrections": enhanced_result.get("corrections", []),
+                                "table_structure": enhanced_result.get("table_structure", {}),
+                                "error": enhanced_result.get("error")
+                            }
+                        }
+                    except Exception as e:
+                        print(f"LLM增强失败，返回原始数据: {e}")
+                        # LLM增强失败时返回原始数据
+                        return {
+                            "success": True,
+                            "data": {
+                                "headers": data_matrix[0] if data_matrix else [],
+                                "rows": data_matrix[1:] if len(data_matrix) > 1 else []
+                            },
+                            "enhancement": {
+                                "applied": False,
+                                "error": f"LLM增强失败: {str(e)}"
+                            }
+                        }
+                else:
+                    # 不使用LLM增强
+                    return {
+                        "success": True,
+                        "data": {
+                            "headers": data_matrix[0] if data_matrix else [],
+                            "rows": data_matrix[1:] if len(data_matrix) > 1 else []
+                        },
+                        "enhancement": {
+                            "applied": False
+                        }
                     }
-                }
             else:
                 return {
                     "success": False,
@@ -164,9 +213,53 @@ async def ocr_table(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"OCR服务调用失败: {str(e)}")
 
 
+@app.post("/api/synthesize")
+async def synthesize_table(text: str):
+    """
+    从文本内容中合成表格
+    """
+    if not text or len(text.strip()) < 10:
+        return {
+            "success": False,
+            "error": "文本内容过短，无法合成表格"
+        }
+    
+    try:
+        # 使用LLM从文本中合成表格
+        synthesis_result = llm_enhancer.synthesize_table_from_text(text)
+        
+        synthesized_table = synthesis_result.get("synthesized_table", [])
+        confidence = synthesis_result.get("confidence", 0.0)
+        
+        if synthesized_table and len(synthesized_table) > 0:
+            return {
+                "success": True,
+                "data": {
+                    "headers": synthesized_table[0] if synthesized_table else [],
+                    "rows": synthesized_table[1:] if len(synthesized_table) > 1 else []
+                },
+                "synthesis": {
+                    "confidence": confidence,
+                    "extracted_info": synthesis_result.get("extracted_info", {}),
+                    "error": synthesis_result.get("error")
+                }
+            }
+        else:
+            return {
+                "success": False,
+                "error": "无法从文本中合成表格",
+                "detail": synthesis_result.get("error", "未知错误")
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"表格合成失败: {str(e)}"
+        }
+
+
 @app.get("/")
 async def root():
-    return {"message": "高考分数线OCR服务API"}
+    return {"message": "高考分数线OCR服务API（支持LLM增强）"}
 
 
 if __name__ == '__main__':
