@@ -4,6 +4,37 @@ import re
 import logging
 from typing import List, Dict, Any, Optional
 
+def try_fix_json(json_str: str) -> str:
+    """尝试修复常见的JSON格式错误"""
+    try:
+        # 尝试直接解析
+        json.loads(json_str)
+        return json_str
+    except json.JSONDecodeError:
+        pass
+
+    # 常见修复策略
+    fixed = json_str
+
+    # 1. 修复缺少逗号的问题：在 } 后跟 " 之间加逗号
+    fixed = re.sub(r'}\s*"', '}, "', fixed)
+    fixed = re.sub(r']\s*"', '], "', fixed)
+
+    # 2. 修复缺少逗号的问题：在 " 后跟 { 之间加逗号
+    fixed = re.sub(r'"\s*{', '", {', fixed)
+    fixed = re.sub(r'"\s*\[', '", [', fixed)
+
+    # 3. 移除尾随逗号：在 } 或 ] 前的逗号
+    fixed = re.sub(r',\s*}', '}', fixed)
+    fixed = re.sub(r',\s*]', ']', fixed)
+
+    # 4. 修复缺少逗号的问题：在数字或字符串后跟 " 之间加逗号
+    fixed = re.sub(r'"\s*\n\s*"', '",\n"', fixed)
+    fixed = re.sub(r':\s*\[\s*\]', ': []', fixed)
+    fixed = re.sub(r':\s*\{\s*\}', ': {}', fixed)
+
+    return fixed
+
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,7 +48,7 @@ class LLMEnhancer:
             "Content-Type": "application/json"
         }
     
-    def call_llm(self, prompt: str, max_tokens: int = 2000) -> Optional[str]:
+    def call_llm(self, prompt: str, max_tokens: int = 8000) -> Optional[str]:
         """调用DeepSeek LLM API"""
         url = f"{self.base_url}/chat/completions"
 
@@ -83,8 +114,7 @@ class LLMEnhancer:
         table_text = self._format_table_for_llm(table_data)
         ocr_context = self._extract_ocr_context(original_ocr_result)
         
-        prompt = f"""
-请分析以下OCR识别的表格数据，并进行智能增强：
+        prompt = f"""请分析以下OCR识别的表格数据，并进行智能增强。
 
 原始OCR识别结果（包含位置信息）：
 {ocr_context}
@@ -98,20 +128,29 @@ class LLMEnhancer:
 3. 标准化数据格式（如统一日期、数字格式）
 4. 识别表头和数据行的逻辑关系
 
-请返回JSON格式的结果：
+【重要】请直接返回纯JSON格式的结果，严格遵守以下要求：
+- 不要使用markdown代码块（不要用```json或```）
+- 不要添加任何文字说明、解释或注释
+- 直接以{{开始，以}}结束
+- 确保JSON格式完全正确，可以正常解析
+
+返回格式：
 {{
-    "enhanced_table": [[表头], [行1], [行2], ...],
+    "enhanced_table": [
+        ["学校名称", "录取分数线", "年份"],
+        ["北京大学", "680", "2023"],
+        ["清华大学", "685", "2023"]
+    ],
     "corrections": [
-        {{"original": "原文本", "corrected": "纠正后", "reason": "纠正原因"}}
+        {{"original": "北大", "corrected": "北京大学", "reason": "规范学校名称"}},
+        {{"original": "68O", "corrected": "680", "reason": "纠正数字识别错误"}}
     ],
     "table_structure": {{
-        "headers": ["表头1", "表头2", ...],
-        "data_types": ["类型1", "类型2", ...],
-        "estimated_columns": 列数
+        "headers": ["学校名称", "录取分数线", "年份"],
+        "data_types": ["string", "integer", "year"],
+        "estimated_columns": 3
     }}
 }}
-
-请确保enhanced_table是一个完整的二维数组，保持行列结构。
 """
         
         llm_response = self.call_llm(prompt)
@@ -128,16 +167,79 @@ class LLMEnhancer:
                 },
                 "error": error_detail
             }
-        
+
+        # 检查响应是否被截断
+        if not llm_response.strip().endswith('}'):
+            error_detail = f"LLM响应被截断（完整响应需要更多tokens），当前长度: {len(llm_response)}"
+            logger.error(f"LLM增强失败: {error_detail}")
+            logger.error(f"响应结尾: ...{llm_response[-200:]}")
+            return {
+                "enhanced_table": table_data,
+                "corrections": [],
+                "table_structure": {
+                    "headers": table_data[0] if table_data else [],
+                    "data_types": [],
+                    "estimated_columns": len(table_data[0]) if table_data else 0
+                },
+                "error": error_detail
+            }
+
         # 解析LLM响应
         try:
-            # 尝试提取JSON部分
-            json_match = re.search(r'\{[\s\S]*\}', llm_response)
+            logger.info("开始解析LLM响应...")
+
+            # 保存原始响应用于调试
+            with open('llm_response_raw.txt', 'w', encoding='utf-8') as f:
+                f.write(llm_response)
+            logger.info("原始响应已保存到 llm_response_raw.txt")
+
+            # 移除markdown代码块标记
+            cleaned_response = llm_response
+            # 移除 ```json 和 ``` 标记
+            cleaned_response = re.sub(r'```json\s*', '', cleaned_response)
+            cleaned_response = re.sub(r'```\s*', '', cleaned_response)
+            cleaned_response = cleaned_response.strip()
+
+            logger.info(f"清理后的响应长度: {len(cleaned_response)} 字符")
+            logger.info(f"响应开头: {cleaned_response[:200]}...")
+
+            # 尝试提取JSON部分（找到第一个 { 和最后一个 }）
+            json_match = re.search(r'\{[\s\S]*\}', cleaned_response)
             if json_match:
-                enhanced_result = json.loads(json_match.group())
-                return enhanced_result
+                json_str = json_match.group()
+                logger.info(f"提取的JSON长度: {len(json_str)} 字符")
+
+                # 保存提取的JSON用于调试
+                with open('llm_response_extracted.json', 'w', encoding='utf-8') as f:
+                    f.write(json_str)
+                logger.info("提取的JSON已保存到 llm_response_extracted.json")
+
+                # 先尝试直接解析
+                try:
+                    enhanced_result = json.loads(json_str)
+                    logger.info("JSON解析成功（直接解析）")
+                    return enhanced_result
+                except json.JSONDecodeError as e:
+                    logger.warning(f"直接解析失败: {e}，尝试修复JSON...")
+
+                    # 尝试修复JSON
+                    fixed_json = try_fix_json(json_str)
+
+                    # 保存修复后的JSON用于调试
+                    with open('llm_response_fixed.json', 'w', encoding='utf-8') as f:
+                        f.write(fixed_json)
+                    logger.info("修复后的JSON已保存到 llm_response_fixed.json")
+
+                    try:
+                        enhanced_result = json.loads(fixed_json)
+                        logger.info("JSON解析成功（修复后）")
+                        return enhanced_result
+                    except json.JSONDecodeError as e2:
+                        logger.error(f"修复后仍然解析失败: {e2}")
+                        raise e2
             else:
                 # 如果无法解析为JSON，返回原始数据
+                logger.error("无法在响应中找到有效的JSON结构")
                 print("无法解析LLM响应为JSON")
                 return {
                     "enhanced_table": table_data,
@@ -150,6 +252,8 @@ class LLMEnhancer:
                     "error": "LLM响应格式错误"
                 }
         except json.JSONDecodeError as e:
+            logger.error(f"JSON解析错误: {e}")
+            logger.error(f"错误的JSON片段: {cleaned_response[:500] if 'cleaned_response' in locals() else llm_response[:500]}")
             print(f"JSON解析错误: {e}")
             return {
                 "enhanced_table": table_data,
