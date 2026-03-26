@@ -93,7 +93,8 @@
       </div>
     </div>
 
-    <div v-if="tableData.headers.length > 0" class="table-section">
+    <!-- 单个表格或未拆分的情况 -->
+    <div v-if="!isSplit && tableData.headers.length > 0" class="table-section">
       <div class="table-header">
         <h3>{{ enhancementInfo.applied ? '智能识别结果' : '识别结果' }}</h3>
         <div class="table-actions">
@@ -125,6 +126,47 @@
         <span v-if="enhancementInfo.applied" class="enhancement-indicator">✓ AI增强已应用</span>
       </div>
     </div>
+
+    <!-- 多个拆分表格的情况 -->
+    <div v-if="isSplit && splitTables.length > 0" class="tables-section">
+      <div class="split-info-header">
+        <h3>{{ enhancementInfo.applied ? '智能识别结果' : '识别结果' }}</h3>
+        <span class="split-badge">检测到 {{ splitTables.length }} 个表格</span>
+      </div>
+
+      <div v-for="(table, tableIndex) in splitTables" :key="tableIndex" class="table-section">
+        <div class="table-header">
+          <h4>表格 {{ tableIndex + 1 }}</h4>
+          <div class="table-actions">
+            <button @click="exportSingleTableCsv(tableIndex)" class="export-btn">导出表格 {{ tableIndex + 1 }}</button>
+          </div>
+        </div>
+
+        <div class="table-wrapper">
+          <table class="result-table">
+            <thead>
+              <tr>
+                <th v-for="(header, index) in table.headers" :key="index">
+                  {{ header }}
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(row, rowIndex) in table.rows" :key="rowIndex">
+                <td v-for="(cell, cellIndex) in row" :key="cellIndex">
+                  {{ cell }}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="table-info">
+          <span>共 {{ table.rows.length }} 行数据</span>
+          <span v-if="enhancementInfo.applied" class="enhancement-indicator">✓ AI增强已应用</span>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -132,6 +174,11 @@
 import { ref, reactive } from 'vue'
 
 interface TableData {
+  headers: string[]
+  rows: string[][]
+}
+
+interface SplitTable {
   headers: string[]
   rows: string[][]
 }
@@ -148,6 +195,9 @@ const tableData = reactive<TableData>({
   headers: [],
   rows: []
 })
+
+const splitTables = ref<SplitTable[]>([])
+const isSplit = ref(false)
 
 interface Correction {
   original: string
@@ -216,8 +266,10 @@ const clearImage = () => {
   selectedFile.value = null
   tableData.headers = []
   tableData.rows = []
+  splitTables.value = []
+  isSplit.value = false
   errorMessage.value = ''
-  
+
   // 重置增强信息
   enhancementInfo.applied = false
   enhancementInfo.corrections = []
@@ -256,9 +308,22 @@ const startOcr = async () => {
     const result = await response.json()
 
     if (result.success) {
-      tableData.headers = result.data.headers
-      tableData.rows = result.data.rows
-      
+      // 检查是否有多个表格
+      if (result.data.tables && result.data.tables.length > 0) {
+        // 多个拆分表格
+        splitTables.value = result.data.tables
+        isSplit.value = true
+        // 使用第一个表格作为默认显示（兼容旧逻辑）
+        tableData.headers = result.data.tables[0].headers
+        tableData.rows = result.data.tables[0].rows
+      } else {
+        // 单个表格
+        splitTables.value = []
+        isSplit.value = false
+        tableData.headers = result.data.headers
+        tableData.rows = result.data.rows
+      }
+
       // 保存增强信息
       if (result.enhancement) {
         enhancementInfo.applied = result.enhancement.applied
@@ -290,6 +355,23 @@ const exportCsv = () => {
   const link = document.createElement('a')
   link.href = URL.createObjectURL(blob)
   link.download = 'ocr_result.csv'
+  link.click()
+}
+
+// 导出单个表格CSV
+const exportSingleTableCsv = (tableIndex: number) => {
+  if (!splitTables.value[tableIndex]) return
+
+  const table = splitTables.value[tableIndex]
+  const csvContent = [
+    table.headers.join(','),
+    ...table.rows.map(row => row ? row.join(',') : '')
+  ].join('\n')
+
+  const blob = new Blob(['\ufeff' + csvContent], { type: 'text/csv;charset=utf-8;' })
+  const link = document.createElement('a')
+  link.href = URL.createObjectURL(blob)
+  link.download = `ocr_result_table_${tableIndex + 1}.csv`
   link.click()
 }
 </script>
@@ -674,5 +756,46 @@ const exportCsv = () => {
 .error-text {
   color: #c62828;
   font-size: 0.9rem;
+}
+
+/* 多表格显示样式 */
+.tables-section {
+  display: flex;
+  flex-direction: column;
+  gap: 2rem;
+}
+
+.split-info-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 1rem 1.5rem;
+  background: linear-gradient(135deg, #e3f2fd, #f3e5f5);
+  border: 1px solid #9c27b0;
+  border-radius: 8px 8px 0 0;
+}
+
+.split-info-header h3 {
+  margin: 0;
+  color: #7b1fa2;
+}
+
+.split-badge {
+  background: #9c27b0;
+  color: white;
+  padding: 0.5rem 1rem;
+  border-radius: 20px;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.tables-section .table-section {
+  margin-top: 0;
+}
+
+.tables-section .table-header h4 {
+  margin: 0;
+  color: #333;
+  font-size: 1.1rem;
 }
 </style>

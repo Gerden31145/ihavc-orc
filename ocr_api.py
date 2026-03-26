@@ -3,7 +3,13 @@ from fastapi.middleware.cors import CORSMiddleware
 import base64
 import requests
 import uvicorn
+import logging
 from llm_enhancer import LLMEnhancer
+from table_splitter import split_table_by_repeated_headers, merge_split_results
+
+# 配置日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="高考分数线OCR服务")
 
@@ -152,26 +158,87 @@ async def ocr_table(file: UploadFile = File(...), enhance: bool = True):
                 # 如果启用LLM增强
                 if enhance:
                     try:
+                        # 先调用LLM增强整个表格
                         enhanced_result = llm_enhancer.enhance_table_data(data_matrix, result)
-                        
+
+                        # 检查LLM增强后的表格是否有重复表头
+                        enhanced_table = enhanced_result.get("enhanced_table", data_matrix)
+                        if enhanced_table and len(enhanced_table) > 0:
+                            enhanced_header = enhanced_table[0]
+                            logger.info(f"LLM增强后表头: {enhanced_header}")
+
+                            # 检测并拆分重复表头的表格
+                            split_tables = split_table_by_repeated_headers(enhanced_table)
+
+                            if len(split_tables) > 1:
+                                logger.info(f"LLM增强后的表格被拆分为 {len(split_tables)} 个子表格")
+
+                                # 构建拆分后的结果
+                                split_results = []
+                                for split_table in split_tables:
+                                    # 为每个子表格创建结果（使用相同的corrections和structure）
+                                    split_results.append({
+                                        "enhanced_table": split_table,
+                                        "corrections": enhanced_result.get("corrections", []),
+                                        "table_structure": {
+                                            "headers": split_table[0] if split_table else [],
+                                            "data_types": [],
+                                            "estimated_columns": len(split_table[0]) if split_table else 0
+                                        }
+                                    })
+
+                                # 合并所有子表格
+                                enhanced_result = merge_split_results(split_results)
+
                         # 使用增强后的表格数据
                         enhanced_table = enhanced_result.get("enhanced_table", data_matrix)
-                        
-                        return {
-                            "success": True,
-                            "data": {
-                                "headers": enhanced_table[0] if enhanced_table else [],
-                                "rows": enhanced_table[1:] if len(enhanced_table) > 1 else [],
-                                "original_headers": data_matrix[0] if data_matrix else [],
-                                "original_rows": data_matrix[1:] if len(data_matrix) > 1 else []
-                            },
-                            "enhancement": {
-                                "applied": True,
-                                "corrections": enhanced_result.get("corrections", []),
-                                "table_structure": enhanced_result.get("table_structure", {}),
-                                "error": enhanced_result.get("error")
+                        split_info = enhanced_result.get("split_info", {})
+
+                        # 如果表格被拆分，返回拆分后的多个表格
+                        if split_info.get("was_split") and split_info.get("table_count", 0) > 1:
+                            # 重新获取拆分后的独立表格
+                            split_tables = split_table_by_repeated_headers(enhanced_table)
+
+                            # 构建返回数据：只返回拆分后的表格数组
+                            return {
+                                "success": True,
+                                "data": {
+                                    "tables": [
+                                        {
+                                            "headers": table[0] if table else [],
+                                            "rows": table[1:] if len(table) > 1 else []
+                                        }
+                                        for table in split_tables
+                                    ],
+                                    "is_split": True,
+                                    "table_count": len(split_tables)
+                                },
+                                "enhancement": {
+                                    "applied": True,
+                                    "corrections": enhanced_result.get("corrections", []),
+                                    "table_structure": enhanced_result.get("table_structure", {}),
+                                    "split_info": split_info,
+                                    "error": enhanced_result.get("error")
+                                }
                             }
-                        }
+                        else:
+                            # 未拆分，返回单个表格（保持原有格式）
+                            return {
+                                "success": True,
+                                "data": {
+                                    "headers": enhanced_table[0] if enhanced_table else [],
+                                    "rows": enhanced_table[1:] if len(enhanced_table) > 1 else [],
+                                    "original_headers": data_matrix[0] if data_matrix else [],
+                                    "original_rows": data_matrix[1:] if len(data_matrix) > 1 else []
+                                },
+                                "enhancement": {
+                                    "applied": True,
+                                    "corrections": enhanced_result.get("corrections", []),
+                                    "table_structure": enhanced_result.get("table_structure", {}),
+                                    "split_info": split_info,
+                                    "error": enhanced_result.get("error")
+                                }
+                            }
                     except Exception as e:
                         print(f"LLM增强失败，返回原始数据: {e}")
                         # LLM增强失败时返回原始数据
