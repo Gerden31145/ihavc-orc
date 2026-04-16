@@ -1,0 +1,20 @@
+{
+    "enhanced_table": [
+        ["域名", "Domain Name", "chengge.top"],
+        ["注册所有者", "Registrant", "邓俊城"],
+        ["域名所属注册机构", "Registrar", "烟台帝思普网络科技有限公司"],
+        ["域名注册时间", "Registration Date", "2025-05-17 20:52:41"],
+        ["域名到期时间", "Expiration Date", "2027-05-17 20:52:41"]
+    ],
+    "corrections": [
+        {"original": "2025-05-1720:52:41", "corrected": "2025-05-17 20:52:41", "reason": "纠正日期时间格式，添加空格分隔"},
+        {"original": "2027-05-17\n20:52:41", "corrected": "2027-05-17 20:52:41", "reason": "合并换行并标准化日期时间格式"},
+        {"original": "deng jun cheng", "corrected": "邓俊城", "reason": "中文姓名标准化，移除拼音"},
+        {"original": "DNSPod,Inc.", "corrected": "烟台帝思普网络科技有限公司", "reason": "统一使用中文机构名称"}
+    ],
+    "table_structure": {
+        "headers": ["字段中文名", "字段英文名", "值"],
+        "data_types": ["string", "string", "string"],
+        "estimated_columns": 3
+    }
+}

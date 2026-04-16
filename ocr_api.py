@@ -1,19 +1,22 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 import base64
+import logging
+import os
+import time
+from typing import Any, Dict, List, Optional
+
 import requests
 import uvicorn
-import logging
-from llm_enhancer import LLMEnhancer
-from table_splitter import split_table_by_repeated_headers, merge_split_results
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 
-# 配置日志
+from llm_enhancer_v2 import LLMEnhancer
+from ocr_postprocess import build_table_from_cells, preprocess_image_for_ocr, repair_table_structure
+from table_splitter import merge_split_results, split_table_by_repeated_headers
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="高考分数线OCR服务")
-
-# 添加CORS支持
+app = FastAPI(title="Gaokao OCR Service")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,313 +25,227 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 百度云API信息
-API_KEY = "oRirY5AYCHC7giulzzLj4jFV"
-SECRET_KEY = "OHkKy4zC8rSKulma0XQOQ04mn1RACtfl"
+API_KEY = os.getenv("BAIDU_OCR_API_KEY", "oRirY5AYCHC7giulzzLj4jFV")
+SECRET_KEY = os.getenv("BAIDU_OCR_SECRET_KEY", "OHkKy4zC8rSKulma0XQOQ04mn1RACtfl")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-d114b6faaa5942969eaaba903080c713")
 
-# DeepSeek LLM API信息
-DEEPSEEK_API_KEY = "sk-d114b6faaa5942969eaaba903080c713"
-
-# 初始化LLM增强器
+http_session = requests.Session()
+access_token_cache = {"value": None, "expires_at": 0.0}
 llm_enhancer = LLMEnhancer(api_key=DEEPSEEK_API_KEY)
 
 
-def get_access_token():
-    """获取百度API访问令牌"""
-    url = "https://aip.baidubce.com/oauth/2.0/token"
-    params = {
-        "grant_type": "client_credentials",
-        "client_id": API_KEY,
-        "client_secret": SECRET_KEY
-    }
+def get_access_token() -> Optional[str]:
+    if access_token_cache["value"] and access_token_cache["expires_at"] > time.time():
+        return access_token_cache["value"]
+
     try:
-        res = requests.post(url, params=params)
-        return res.json().get("access_token")
-    except Exception as e:
-        print(f"获取token失败: {e}")
+        response = http_session.post(
+            "https://aip.baidubce.com/oauth/2.0/token",
+            params={
+                "grant_type": "client_credentials",
+                "client_id": API_KEY,
+                "client_secret": SECRET_KEY,
+            },
+            timeout=15,
+        )
+        payload = response.json()
+        token = payload.get("access_token")
+        expires_in = int(payload.get("expires_in", 2592000))
+        if token:
+            access_token_cache["value"] = token
+            access_token_cache["expires_at"] = time.time() + max(60, expires_in - 300)
+        return token
+    except Exception as exc:
+        logger.exception("Failed to get access token: %s", exc)
         return None
 
 
-def process_single_table(cells):
-    """
-    处理单个表格的单元格数据
-    """
+def process_single_table(cells: List[Dict[str, Any]]):
     if not cells:
         return None
-
-    # 找出最大行和最大列，确定表格大小
-    max_row = max([cell['row_end'] for cell in cells]) + 1
-    max_col = max([cell['col_end'] for cell in cells]) + 1
-
-    # 初始化一个空白矩阵
-    matrix = [["" for _ in range(max_col)] for _ in range(max_row)]
-
-    # 填充数据
-    for cell in cells:
-        r = cell['row_start']
-        c = cell['col_start']
-        text = cell['words']
-        matrix[r][c] = text
-
-    return matrix
+    return build_table_from_cells(cells)
 
 
-def process_table_data(tables_result):
-    """
-    处理百度OCR返回的表格数据，支持多个表格
-    如果有多个表格，会尝试合并它们（假设表头相同）
-    """
+def process_table_data(tables_result: List[Dict[str, Any]]):
     if not tables_result:
         return None
 
     all_tables = []
-
-    # 处理所有识别到的表格
-    for table_idx, table_data in enumerate(tables_result):
-        cells = table_data.get('body', [])
-        if cells:
-            matrix = process_single_table(cells)
-            if matrix:
-                all_tables.append(matrix)
-                print(f"已识别表格 {table_idx + 1}: {len(matrix)} 行 x {len(matrix[0])} 列")
+    for table in tables_result:
+        matrix = process_single_table(table.get("body", []))
+        if matrix:
+            all_tables.append(matrix)
 
     if not all_tables:
         return None
-
-    # 如果只有一个表格，直接返回
     if len(all_tables) == 1:
         return all_tables[0]
 
-    # 如果有多个表格，尝试合并它们
-    print(f"\n检测到 {len(all_tables)} 个表格，正在合并...")
-
-    # 假设所有表格的第一行都是表头，检查表头是否相同
-    headers = [table[0] for table in all_tables]
-
-    # 找出最长的表头
-    max_header = max(headers, key=len)
-
-    # 合并所有表格的数据（跳过表头，保留第一个表头）
-    merged_matrix = [max_header]  # 使用第一个表的表头
-
+    max_header = max((table[0] for table in all_tables if table), key=len)
+    merged_matrix = [max_header]
     for table in all_tables:
-        # 添加每个表格的数据行（跳过表头行）
         if len(table) > 1:
             merged_matrix.extend(table[1:])
-
-    print(f"合并后: {len(merged_matrix)} 行 x {len(merged_matrix[0])} 列")
     return merged_matrix
+
+
+def build_table_response(table: List[List[str]]) -> Dict[str, Any]:
+    return {
+        "headers": table[0] if table else [],
+        "rows": table[1:] if len(table) > 1 else [],
+    }
 
 
 @app.post("/api/ocr")
 async def ocr_table(file: UploadFile = File(...), enhance: bool = True):
-    """
-    OCR识别表格图片，可选择是否使用LLM增强
-    """
-    # 验证文件类型
-    if not file.content_type.startswith('image/'):
-        raise HTTPException(status_code=400, detail="只支持图片文件")
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image uploads are supported")
 
-    # 获取访问令牌
     access_token = get_access_token()
     if not access_token:
-        raise HTTPException(status_code=500, detail="获取OCR服务令牌失败")
+        raise HTTPException(status_code=500, detail="Failed to get OCR access token")
 
-    # 读取图片并转换为base64
+    started_at = time.perf_counter()
     try:
         image_data = await file.read()
-        base64_str = base64.b64encode(image_data).decode('utf-8')
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"读取图片失败: {str(e)}")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to read image: {exc}")
 
-    # 调用百度OCR API
-    url = f"https://aip.baidubce.com/rest/2.0/ocr/v1/table?access_token={access_token}"
-    payload = {'image': base64_str}
-    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-
+    processed_image, preprocess_info = preprocess_image_for_ocr(image_data)
     try:
-        response = requests.post(url, headers=headers, data=payload)
+        response = http_session.post(
+            f"https://aip.baidubce.com/rest/2.0/ocr/v1/table?access_token={access_token}",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={"image": base64.b64encode(processed_image).decode("utf-8")},
+            timeout=45,
+        )
         result = response.json()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"OCR request failed: {exc}")
 
-        if "tables_result" in result:
-            # 处理表格数据
-            data_matrix = process_table_data(result["tables_result"])
+    if "tables_result" not in result:
+        return {
+            "success": False,
+            "error": "OCR recognition failed",
+            "detail": result.get("error_msg", "unknown_error"),
+        }
 
-            if data_matrix:
-                # 如果启用LLM增强
-                if enhance:
-                    try:
-                        # 先调用LLM增强整个表格
-                        enhanced_result = llm_enhancer.enhance_table_data(data_matrix, result)
+    data_matrix = process_table_data(result["tables_result"])
+    if not data_matrix:
+        return {"success": False, "error": "No valid table content extracted"}
 
-                        # 检查LLM增强后的表格是否有重复表头
-                        enhanced_table = enhanced_result.get("enhanced_table", data_matrix)
-                        if enhanced_table and len(enhanced_table) > 0:
-                            enhanced_header = enhanced_table[0]
-                            logger.info(f"LLM增强后表头: {enhanced_header}")
+    rule_result = repair_table_structure(data_matrix)
+    working_table = rule_result["table"]
+    final_result = {
+        "enhanced_table": working_table,
+        "corrections": rule_result.get("corrections", []),
+        "table_structure": {
+            "headers": working_table[0] if working_table else [],
+            "data_types": [],
+            "estimated_columns": len(working_table[0]) if working_table else 0,
+        },
+        "split_info": {"was_split": False, "table_count": 1},
+        "diagnostics": {
+            "numeric_columns": rule_result.get("numeric_columns", []),
+            "suspicious_rows": rule_result.get("suspicious_rows", []),
+            "llm_used": False,
+        },
+    }
 
-                            # 检测并拆分重复表头的表格
-                            split_tables = split_table_by_repeated_headers(enhanced_table)
+    if enhance:
+        try:
+            final_result = llm_enhancer.enhance_table_data(working_table, result)
+        except Exception as exc:
+            logger.exception("LLM enhancement failed: %s", exc)
+            final_result["error"] = f"llm_enhance_failed: {exc}"
 
-                            if len(split_tables) > 1:
-                                logger.info(f"LLM增强后的表格被拆分为 {len(split_tables)} 个子表格")
-
-                                # 构建拆分后的结果
-                                split_results = []
-                                for split_table in split_tables:
-                                    # 为每个子表格创建结果（使用相同的corrections和structure）
-                                    split_results.append({
-                                        "enhanced_table": split_table,
-                                        "corrections": enhanced_result.get("corrections", []),
-                                        "table_structure": {
-                                            "headers": split_table[0] if split_table else [],
-                                            "data_types": [],
-                                            "estimated_columns": len(split_table[0]) if split_table else 0
-                                        }
-                                    })
-
-                                # 合并所有子表格
-                                enhanced_result = merge_split_results(split_results)
-
-                        # 使用增强后的表格数据
-                        enhanced_table = enhanced_result.get("enhanced_table", data_matrix)
-                        split_info = enhanced_result.get("split_info", {})
-
-                        # 如果表格被拆分，返回拆分后的多个表格
-                        if split_info.get("was_split") and split_info.get("table_count", 0) > 1:
-                            # 重新获取拆分后的独立表格
-                            split_tables = split_table_by_repeated_headers(enhanced_table)
-
-                            # 构建返回数据：只返回拆分后的表格数组
-                            return {
-                                "success": True,
-                                "data": {
-                                    "tables": [
-                                        {
-                                            "headers": table[0] if table else [],
-                                            "rows": table[1:] if len(table) > 1 else []
-                                        }
-                                        for table in split_tables
-                                    ],
-                                    "is_split": True,
-                                    "table_count": len(split_tables)
-                                },
-                                "enhancement": {
-                                    "applied": True,
-                                    "corrections": enhanced_result.get("corrections", []),
-                                    "table_structure": enhanced_result.get("table_structure", {}),
-                                    "split_info": split_info,
-                                    "error": enhanced_result.get("error")
-                                }
-                            }
-                        else:
-                            # 未拆分，返回单个表格（保持原有格式）
-                            return {
-                                "success": True,
-                                "data": {
-                                    "headers": enhanced_table[0] if enhanced_table else [],
-                                    "rows": enhanced_table[1:] if len(enhanced_table) > 1 else [],
-                                    "original_headers": data_matrix[0] if data_matrix else [],
-                                    "original_rows": data_matrix[1:] if len(data_matrix) > 1 else []
-                                },
-                                "enhancement": {
-                                    "applied": True,
-                                    "corrections": enhanced_result.get("corrections", []),
-                                    "table_structure": enhanced_result.get("table_structure", {}),
-                                    "split_info": split_info,
-                                    "error": enhanced_result.get("error")
-                                }
-                            }
-                    except Exception as e:
-                        print(f"LLM增强失败，返回原始数据: {e}")
-                        # LLM增强失败时返回原始数据
-                        return {
-                            "success": True,
-                            "data": {
-                                "headers": data_matrix[0] if data_matrix else [],
-                                "rows": data_matrix[1:] if len(data_matrix) > 1 else []
-                            },
-                            "enhancement": {
-                                "applied": False,
-                                "error": f"LLM增强失败: {str(e)}"
-                            }
-                        }
-                else:
-                    # 不使用LLM增强
-                    return {
-                        "success": True,
-                        "data": {
-                            "headers": data_matrix[0] if data_matrix else [],
-                            "rows": data_matrix[1:] if len(data_matrix) > 1 else []
-                        },
-                        "enhancement": {
-                            "applied": False
-                        }
-                    }
-            else:
-                return {
-                    "success": False,
-                    "error": "未能提取到有效表格内容"
+    enhanced_table = final_result.get("enhanced_table", working_table)
+    split_tables = split_table_by_repeated_headers(enhanced_table)
+    if len(split_tables) > 1:
+        final_result = merge_split_results(
+            [
+                {
+                    "enhanced_table": split_table,
+                    "corrections": final_result.get("corrections", []),
+                    "table_structure": {
+                        "headers": split_table[0] if split_table else [],
+                        "data_types": [],
+                        "estimated_columns": len(split_table[0]) if split_table else 0,
+                    },
                 }
-        else:
-            return {
-                "success": False,
-                "error": "OCR识别失败",
-                "detail": result.get("error_msg", "未知错误")
-            }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OCR服务调用失败: {str(e)}")
+                for split_table in split_tables
+            ]
+        )
+        enhanced_table = final_result.get("enhanced_table", enhanced_table)
+
+    enhancement_payload = {
+        "applied": bool(final_result.get("diagnostics", {}).get("llm_used")),
+        "corrections": final_result.get("corrections", []),
+        "table_structure": final_result.get("table_structure", {}),
+        "split_info": final_result.get("split_info", {"was_split": False, "table_count": 1}),
+        "error": final_result.get("error"),
+        "diagnostics": {
+            **final_result.get("diagnostics", {}),
+            "preprocess": preprocess_info,
+            "timing_ms": {"total": int((time.perf_counter() - started_at) * 1000)},
+        },
+    }
+
+    if enhancement_payload["split_info"].get("was_split") and enhancement_payload["split_info"].get("table_count", 0) > 1:
+        split_tables = split_table_by_repeated_headers(enhanced_table)
+        return {
+            "success": True,
+            "data": {
+                "tables": [build_table_response(table) for table in split_tables],
+                "is_split": True,
+                "table_count": len(split_tables),
+            },
+            "enhancement": enhancement_payload,
+        }
+
+    return {
+        "success": True,
+        "data": {
+            **build_table_response(enhanced_table),
+            "original_headers": data_matrix[0] if data_matrix else [],
+            "original_rows": data_matrix[1:] if len(data_matrix) > 1 else [],
+        },
+        "enhancement": enhancement_payload,
+    }
 
 
 @app.post("/api/synthesize")
 async def synthesize_table(text: str):
-    """
-    从文本内容中合成表格
-    """
     if not text or len(text.strip()) < 10:
-        return {
-            "success": False,
-            "error": "文本内容过短，无法合成表格"
-        }
-    
+        return {"success": False, "error": "Input text is too short"}
+
     try:
-        # 使用LLM从文本中合成表格
         synthesis_result = llm_enhancer.synthesize_table_from_text(text)
-        
         synthesized_table = synthesis_result.get("synthesized_table", [])
         confidence = synthesis_result.get("confidence", 0.0)
-        
-        if synthesized_table and len(synthesized_table) > 0:
+        if synthesized_table:
             return {
                 "success": True,
-                "data": {
-                    "headers": synthesized_table[0] if synthesized_table else [],
-                    "rows": synthesized_table[1:] if len(synthesized_table) > 1 else []
-                },
+                "data": build_table_response(synthesized_table),
                 "synthesis": {
                     "confidence": confidence,
                     "extracted_info": synthesis_result.get("extracted_info", {}),
-                    "error": synthesis_result.get("error")
-                }
+                    "error": synthesis_result.get("error"),
+                },
             }
-        else:
-            return {
-                "success": False,
-                "error": "无法从文本中合成表格",
-                "detail": synthesis_result.get("error", "未知错误")
-            }
-    except Exception as e:
         return {
             "success": False,
-            "error": f"表格合成失败: {str(e)}"
+            "error": "Failed to synthesize table from text",
+            "detail": synthesis_result.get("error", "unknown_error"),
         }
+    except Exception as exc:
+        return {"success": False, "error": f"Synthesis failed: {exc}"}
 
 
 @app.get("/")
 async def root():
-    return {"message": "高考分数线OCR服务API（支持LLM增强）"}
+    return {"message": "Gaokao OCR service API"}
 
 
-if __name__ == '__main__':
-    print("启动OCR服务...")
+if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
