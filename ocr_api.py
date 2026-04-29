@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from llm_enhancer_v2 import LLMEnhancer
 from ocr_postprocess import build_table_from_cells, preprocess_image_for_ocr, repair_table_structure
+from ppstructure_engine import run_ppstructure
 from table_splitter import merge_split_results, split_table_by_repeated_headers
 
 logging.basicConfig(level=logging.INFO)
@@ -28,6 +29,7 @@ app.add_middleware(
 API_KEY = os.getenv("BAIDU_OCR_API_KEY", "oRirY5AYCHC7giulzzLj4jFV")
 SECRET_KEY = os.getenv("BAIDU_OCR_SECRET_KEY", "OHkKy4zC8rSKulma0XQOQ04mn1RACtfl")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-d114b6faaa5942969eaaba903080c713")
+DEFAULT_OCR_ENGINE = os.getenv("OCR_ENGINE", "baidu").strip().lower()
 
 http_session = requests.Session()
 access_token_cache = {"value": None, "expires_at": 0.0}
@@ -97,13 +99,9 @@ def build_table_response(table: List[List[str]]) -> Dict[str, Any]:
 
 
 @app.post("/api/ocr")
-async def ocr_table(file: UploadFile = File(...), enhance: bool = True):
+async def ocr_table(file: UploadFile = File(...), enhance: bool = True, engine: Optional[str] = None):
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Only image uploads are supported")
-
-    access_token = get_access_token()
-    if not access_token:
-        raise HTTPException(status_code=500, detail="Failed to get OCR access token")
 
     started_at = time.perf_counter()
     try:
@@ -111,28 +109,84 @@ async def ocr_table(file: UploadFile = File(...), enhance: bool = True):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to read image: {exc}")
 
-    processed_image, preprocess_info = preprocess_image_for_ocr(image_data)
-    try:
-        response = http_session.post(
-            f"https://aip.baidubce.com/rest/2.0/ocr/v1/table?access_token={access_token}",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            data={"image": base64.b64encode(processed_image).decode("utf-8")},
-            timeout=45,
-        )
-        result = response.json()
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"OCR request failed: {exc}")
+    selected_engine = (engine or DEFAULT_OCR_ENGINE or "baidu").strip().lower()
 
-    if "tables_result" not in result:
-        return {
-            "success": False,
-            "error": "OCR recognition failed",
-            "detail": result.get("error_msg", "unknown_error"),
-        }
+    # Engine 1: PP-Structure (local) — best effort; fallback to baidu if unavailable.
+    if selected_engine in {"ppstructure", "pp-structure", "paddle", "paddleocr"}:
+        table_matrix, pp_raw, pp_diag = run_ppstructure(image_data)
+        if table_matrix:
+            data_matrix = table_matrix
+            ocr_raw_result: Dict[str, Any] = {"ppstructure": pp_raw, "engine": "ppstructure"}
+            preprocess_info = {"applied": False, "reason": "ppstructure_handles_preprocess"}
+            engine_diag = {
+                "engine": "ppstructure",
+                "ppstructure": {
+                    "model_loaded": pp_diag.model_loaded,
+                    "tables_found": pp_diag.tables_found,
+                    "blocks_found": pp_diag.blocks_found,
+                    "timing_ms": pp_diag.timing_ms,
+                    "error": pp_diag.error,
+                },
+            }
+        else:
+            logger.warning("PP-Structure unavailable or no table found, fallback to Baidu. reason=%s", pp_diag.error)
+            selected_engine = "baidu"
+            engine_diag = {
+                "engine": "ppstructure_fallback_to_baidu",
+                "ppstructure": {
+                    "model_loaded": pp_diag.model_loaded,
+                    "tables_found": pp_diag.tables_found,
+                    "blocks_found": pp_diag.blocks_found,
+                    "timing_ms": pp_diag.timing_ms,
+                    "error": pp_diag.error,
+                },
+            }
+    else:
+        engine_diag = {"engine": "baidu"}
 
-    data_matrix = process_table_data(result["tables_result"])
-    if not data_matrix:
-        return {"success": False, "error": "No valid table content extracted"}
+    # Engine 2: Baidu table OCR (existing behavior)
+    if selected_engine == "baidu":
+        access_token = get_access_token()
+        if not access_token:
+            raise HTTPException(status_code=500, detail="Failed to get OCR access token")
+
+        processed_image, preprocess_info = preprocess_image_for_ocr(image_data)
+        try:
+            response = http_session.post(
+                f"https://aip.baidubce.com/rest/2.0/ocr/v1/table?access_token={access_token}",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data={"image": base64.b64encode(processed_image).decode("utf-8")},
+                timeout=45,
+            )
+            ocr_raw_result = response.json()
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"OCR request failed: {exc}")
+
+        if "tables_result" not in ocr_raw_result:
+            return {
+                "success": False,
+                "error": "OCR recognition failed",
+                "detail": ocr_raw_result.get("error_msg", "unknown_error"),
+                "enhancement": {
+                    "applied": False,
+                    "corrections": [],
+                    "table_structure": {},
+                    "split_info": {"was_split": False, "table_count": 0},
+                    "error": None,
+                    "diagnostics": {
+                        "preprocess": preprocess_info,
+                        "timing_ms": {"total": int((time.perf_counter() - started_at) * 1000)},
+                        **engine_diag,
+                    },
+                },
+            }
+
+        data_matrix = process_table_data(ocr_raw_result["tables_result"])
+        if not data_matrix:
+            return {"success": False, "error": "No valid table content extracted"}
+    else:
+        # Selected engine was PP-Structure and produced a matrix above.
+        pass
 
     rule_result = repair_table_structure(data_matrix)
     working_table = rule_result["table"]
@@ -154,7 +208,7 @@ async def ocr_table(file: UploadFile = File(...), enhance: bool = True):
 
     if enhance:
         try:
-            final_result = llm_enhancer.enhance_table_data(working_table, result)
+            final_result = llm_enhancer.enhance_table_data(working_table, ocr_raw_result)
         except Exception as exc:
             logger.exception("LLM enhancement failed: %s", exc)
             final_result["error"] = f"llm_enhance_failed: {exc}"
@@ -188,6 +242,7 @@ async def ocr_table(file: UploadFile = File(...), enhance: bool = True):
             **final_result.get("diagnostics", {}),
             "preprocess": preprocess_info,
             "timing_ms": {"total": int((time.perf_counter() - started_at) * 1000)},
+            **engine_diag,
         },
     }
 

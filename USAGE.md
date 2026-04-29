@@ -92,6 +92,33 @@ server: {
 2. 修改 `API_KEY` 和 `SECRET_KEY`
 3. 或替换整个OCR调用逻辑
 
+## 🧩 使用 PP-Structure（PaddleOCR）优化结构化提取（可选）
+
+当图片里同时包含标题/多块内容、表格线不完整、或需要更稳定的版面结构化时，建议试试 `PP-Structure`。
+
+### 启用方式
+
+- **方式一：请求参数**：调用 `/api/ocr` 时加 `engine=ppstructure`
+- **方式二：环境变量**：设置 `OCR_ENGINE=ppstructure` 作为默认引擎
+
+如果本机没有安装 PaddleOCR / PaddlePaddle，服务会**自动回退到百度 OCR**，并在返回的 `enhancement.diagnostics` 里给出回退原因。
+
+### 依赖安装（Windows）
+
+1. 先按 PaddlePaddle 官方文档安装 `paddlepaddle`（CPU 或 GPU 版本）
+2. 再安装：
+
+```bash
+pip install paddleocr lxml
+```
+
+### 输出差异
+
+PP-Structure 会在 `enhancement.diagnostics` 中附加：
+
+- `engine`: `ppstructure` / `ppstructure_fallback_to_baidu`
+- `ppstructure`: `tables_found` / `blocks_found` / `timing_ms` / `error`
+
 ## 📊 数据格式
 
 识别结果返回JSON格式：

@@ -25,6 +25,12 @@ NUMERIC_HEADER_HINTS = (
     "线差",
 )
 
+STICKY_HEADER_SPLIT_RULES = (
+    # Common Gaokao table sticky headers (no separator between two concepts)
+    ("投档线投档最低排位", ("投档线", "投档最低排位")),
+    ("投档线最低排位", ("投档线", "最低排位")),
+)
+
 AMBIGUOUS_DIGIT_MAP = str.maketrans(
     {
         "O": "0",
@@ -138,6 +144,60 @@ def normalize_numeric_text(text: str) -> str:
     return tokens[0]
 
 
+def _split_sticky_header_cell(header: str) -> Optional[Tuple[str, str]]:
+    normalized = normalize_cell_text(header)
+    if not normalized:
+        return None
+
+    compact = re.sub(r"\s+", "", normalized)
+    for sticky, parts in STICKY_HEADER_SPLIT_RULES:
+        if compact == sticky:
+            return parts[0], parts[1]
+
+    # Heuristic: "投档线...排位" with no explicit separator.
+    if "投档线" in compact and "排位" in compact and "|" not in compact:
+        if compact == "投档线投档最低排位":
+            return "投档线", "投档最低排位"
+        if compact == "投档线最低排位":
+            return "投档线", "最低排位"
+
+    return None
+
+
+def _split_packed_score_rank(value: str) -> Optional[Tuple[str, str]]:
+    """
+    Split a packed numeric token like "55469531" into ("554", "69531") when plausible.
+    Assumption: Gaokao scores are typically 3 digits (200..750), rank is remaining digits.
+    """
+    normalized = normalize_cell_text(value).translate(AMBIGUOUS_DIGIT_MAP)
+    if not normalized or not re.fullmatch(r"\d{5,}", normalized):
+        return None
+
+    score_part = normalized[:3]
+    rank_part = normalized[3:]
+    try:
+        score = int(score_part)
+        if 200 <= score <= 750 and int(rank_part) >= 0:
+            return score_part, rank_part
+    except Exception:
+        return None
+    return None
+
+
+def _is_score_header(text: str) -> bool:
+    header = re.sub(r"\s+", "", normalize_cell_text(text))
+    if not header:
+        return False
+    return "投档线" in header or "最低分" in header or header.endswith("分")
+
+
+def _is_rank_header(text: str) -> bool:
+    header = re.sub(r"\s+", "", normalize_cell_text(text))
+    if not header:
+        return False
+    return "排位" in header or "位次" in header or "排名" in header
+
+
 def repair_table_structure(table: List[List[str]]) -> Dict[str, Any]:
     if not table:
         return {
@@ -149,6 +209,76 @@ def repair_table_structure(table: List[List[str]]) -> Dict[str, Any]:
 
     repaired = [[normalize_cell_text(cell) for cell in row] for row in table]
     corrections: List[Dict[str, str]] = []
+
+    # Step 0: split sticky headers first, so later numeric-column inference sees the right columns.
+    if repaired and repaired[0]:
+        headers = repaired[0]
+        split_targets: List[Tuple[int, str, str]] = []
+        for index, header in enumerate(headers):
+            split = _split_sticky_header_cell(header)
+            if split:
+                split_targets.append((index, split[0], split[1]))
+
+        # Apply from right to left to keep indices stable.
+        for index, left_header, right_header in reversed(split_targets):
+            original_header = headers[index]
+            headers[index] = left_header
+            headers.insert(index + 1, right_header)
+            corrections.append(
+                {
+                    "original": original_header,
+                    "corrected": f"{left_header} | {right_header}",
+                    "reason": f"split sticky header at column {index + 1}",
+                }
+            )
+
+            for row_index in range(1, len(repaired)):
+                row = repaired[row_index]
+                if index >= len(row):
+                    continue
+                row.insert(index + 1, "")
+                packed = _split_packed_score_rank(row[index])
+                if packed and not normalize_cell_text(row[index + 1]):
+                    original_value = row[index]
+                    row[index], row[index + 1] = packed[0], packed[1]
+                    corrections.append(
+                        {
+                            "original": original_value,
+                            "corrected": f"{packed[0]} | {packed[1]}",
+                            "reason": (
+                                f"split packed score/rank at row {row_index + 1}, "
+                                f"columns {index + 1}-{index + 2}"
+                            ),
+                        }
+                    )
+
+    # Step 0.5: If headers are already separated (score column + rank column),
+    # split packed digits like "55469531" when rank cell is blank.
+    if repaired and repaired[0] and len(repaired[0]) >= 2:
+        headers = repaired[0]
+        for row_index in range(1, len(repaired)):
+            row = repaired[row_index]
+            for col in range(min(len(headers) - 1, len(row) - 1)):
+                if not (_is_score_header(headers[col]) and _is_rank_header(headers[col + 1])):
+                    continue
+                if normalize_cell_text(row[col + 1]):
+                    continue
+                packed = _split_packed_score_rank(row[col])
+                if not packed:
+                    continue
+                original_value = row[col]
+                row[col], row[col + 1] = packed[0], packed[1]
+                corrections.append(
+                    {
+                        "original": original_value,
+                        "corrected": f"{packed[0]} | {packed[1]}",
+                        "reason": (
+                            f"split packed score/rank at row {row_index + 1}, "
+                            f"columns {col + 1}-{col + 2}"
+                        ),
+                    }
+                )
+
     suspicious_rows = set()
     numeric_columns = infer_numeric_columns(repaired)
 
