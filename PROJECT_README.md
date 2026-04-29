@@ -11,6 +11,7 @@
 
 - ✅ **图片上传** - 支持点击选择和拖拽上传
 - ✅ **OCR识别** - 基于百度OCR的高精度表格识别
+- ✅ **PP-Structure辅助切表** - 优先检测表格区域，失败自动回退整图识别
 - ✅ **实时预览** - 上传后立即预览图片
 - ✅ **结果展示** - 清晰的表格展示识别结果
 - ✅ **CSV导出** - 一键导出识别数据
@@ -26,6 +27,7 @@
 ### 后端
 - **FastAPI** - 现代化的Python Web框架
 - **百度OCR API** - 强大的表格识别能力
+- **PP-Structure（可选）** - 表格区域检测与切分辅助
 - **Uvicorn** - ASGI服务器
 
 ## 🚀 快速开始
@@ -125,6 +127,14 @@ ocr-project/
   "success": true,
   "data": {
     "headers": ["年份", "省份", "科类", "批次", "分数"],
+    "meta": {
+      "source_engine": "baidu_table_ocr",
+      "pp_structure": {
+        "enabled": true,
+        "region_count": 1,
+        "fallback_used": false
+      }
+    },
     "rows": [
       ["2023", "河南", "理科", "一本", "514"],
       ["2023", "河南", "文科", "一本", "547"]
@@ -132,6 +142,12 @@ ocr-project/
   }
 }
 ```
+
+### PP-Structure 辅助模式说明
+
+- `/api/ocr` 默认启用 PP-Structure 辅助切表（如果环境已安装）。
+- PP-Structure 不可用或无有效区域时，服务会自动回退到整图百度 OCR 识别。
+- 返回结构保持向后兼容，前端现有 `headers/rows` 渲染逻辑无需修改。
 
 **错误响应：**
 ```json

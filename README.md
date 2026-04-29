@@ -10,6 +10,7 @@
 
 - ✅ 图片上传（支持拖拽）
 - ✅ OCR 表格识别
+- ✅ PP-Structure 辅助切表（失败自动回退整图识别）
 - ✅ 实时预览
 - ✅ 结果展示
 - ✅ CSV 导出
@@ -63,6 +64,12 @@ npm run dev             # 终端2
 
 **前端：** Vue 3 + TypeScript + Vite
 **后端：** FastAPI + 百度OCR API
+
+## PP-Structure 辅助模式
+
+- 后端会优先尝试使用 PP-Structure 检测表格区域，然后将区域图交给百度表格 OCR 识别。
+- 当 PP-Structure 未安装、检测失败或未检测到表格区域时，会自动回退到整图识别，不影响原有流程可用性。
+- 接口仍保持 `data.headers` / `data.rows` 字段兼容，同时在 `data.meta.pp_structure` 中返回辅助诊断信息。
 
 ## 📄 License
 
