@@ -48,7 +48,7 @@ class LLMEnhancer:
             "Content-Type": "application/json"
         }
     
-    def call_llm(self, prompt: str, max_tokens: int = 8000) -> Optional[str]:
+    def call_llm(self, prompt: str, max_tokens: int = 16384) -> Optional[str]:
         """调用DeepSeek LLM API"""
         url = f"{self.base_url}/chat/completions"
 
@@ -79,10 +79,31 @@ class LLMEnhancer:
             if response.status_code == 200:
                 result = response.json()
                 logger.info(f"API响应结构: {list(result.keys())}")
+
+                # 打印 usage 信息以排查 token 消耗
+                if "usage" in result:
+                    usage = result["usage"]
+                    logger.info(f"Token usage: prompt={usage.get('prompt_tokens')}, "
+                                f"completion={usage.get('completion_tokens')}, "
+                                f"total={usage.get('total_tokens')}")
+
                 if "choices" in result and len(result["choices"]) > 0:
-                    content = result["choices"][0]["message"]["content"]
+                    message = result["choices"][0]["message"]
+
+                    # 检查是否有思考过程（DeepSeek reasoning 模型会返回）
+                    reasoning = message.get("reasoning_content", "")
+                    if reasoning:
+                        logger.info(f"检测到思考过程，长度: {len(reasoning)} 字符，已忽略")
+
+                    content = message.get("content", "")
                     logger.info(f"LLM API调用成功，返回内容长度: {len(content)} 字符")
                     logger.info(f"返回内容预览: {content[:200]}...")
+
+                    # 检查 finish_reason，如果是 length 说明被截断
+                    finish_reason = result["choices"][0].get("finish_reason", "")
+                    if finish_reason == "length":
+                        logger.warning(f"LLM 响应因 max_tokens 不足被截断 (finish_reason=length)")
+
                     return content
                 else:
                     logger.error(f"API响应格式异常，没有choices字段: {result}")
@@ -126,13 +147,8 @@ class LLMEnhancer:
 1. 纠正识别错误的文字（特别是数字、专业术语）
 2. 完善表格结构，填充可能的缺失单元格
 3. 标准化数据格式（如统一日期、数字格式）
-4. 识别表头和数据行的逻辑关系
 
-【重要】请直接返回纯JSON格式的结果，严格遵守以下要求：
-- 不要使用markdown代码块（不要用```json或```）
-- 不要添加任何文字说明、解释或注释
-- 直接以{{开始，以}}结束
-- 确保JSON格式完全正确，可以正常解析
+【重要】请直接返回纯JSON格式，不要用markdown代码块，不要添加解释说明。直接以{{开始，以}}结束。
 
 返回格式：
 {{
@@ -140,10 +156,6 @@ class LLMEnhancer:
         ["学校名称", "录取分数线", "年份"],
         ["北京大学", "680", "2023"],
         ["清华大学", "685", "2023"]
-    ],
-    "corrections": [
-        {{"original": "北大", "corrected": "北京大学", "reason": "规范学校名称"}},
-        {{"original": "68O", "corrected": "680", "reason": "纠正数字识别错误"}}
     ],
     "table_structure": {{
         "headers": ["学校名称", "录取分数线", "年份"],
@@ -168,9 +180,14 @@ class LLMEnhancer:
                 "error": error_detail
             }
 
+        # 保存原始响应用于调试（在截断检测之前保存）
+        with open('llm_response_raw.txt', 'w', encoding='utf-8') as f:
+            f.write(llm_response)
+        logger.info("原始响应已保存到 llm_response_raw.txt")
+
         # 检查响应是否被截断
         if not llm_response.strip().endswith('}'):
-            error_detail = f"LLM响应被截断（完整响应需要更多tokens），当前长度: {len(llm_response)}"
+            error_detail = f"LLM响应被截断，当前长度: {len(llm_response)}"
             logger.error(f"LLM增强失败: {error_detail}")
             logger.error(f"响应结尾: ...{llm_response[-200:]}")
             return {
