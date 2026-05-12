@@ -1,6 +1,10 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import base64
+import io
+import json
+import re
+import time
 import requests
 import uvicorn
 import logging
@@ -22,9 +26,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 百度云API信息
-API_KEY = "oRirY5AYCHC7giulzzLj4jFV"
-SECRET_KEY = "OHkKy4zC8rSKulma0XQOQ04mn1RACtfl"
+# Gitee AI DeepSeek-OCR-2 配置
+GITEE_API_KEY = "YNDQSJY1R3VRLUVZTW12OCWFUFBLXBGVZ5ATDUZ4"
+GITEE_BASE_URL = "https://ai.gitee.com/v1"
+GITEE_OCR_MODEL = "DeepSeek-OCR"
 
 # DeepSeek LLM API信息
 DEEPSEEK_API_KEY = "sk-d114b6faaa5942969eaaba903080c713"
@@ -34,100 +39,175 @@ llm_enhancer = LLMEnhancer(api_key=DEEPSEEK_API_KEY)
 _pp_structure_engine = None
 
 
-def get_access_token():
-    """获取百度API访问令牌"""
-    url = "https://aip.baidubce.com/oauth/2.0/token"
-    params = {
-        "grant_type": "client_credentials",
-        "client_id": API_KEY,
-        "client_secret": SECRET_KEY
-    }
+def call_deepseek_ocr(image_data):
+    """调用 Gitee AI DeepSeek-OCR 异步文档解析，返回识别文本。"""
+    submit_url = f"{GITEE_BASE_URL}/async/documents/parse"
+    auth_headers = {"Authorization": f"Bearer {GITEE_API_KEY}"}
+
     try:
-        res = requests.post(url, params=params)
-        return res.json().get("access_token")
+        logger.info(f"提交 OCR 任务: {submit_url}, 图片大小: {len(image_data)} 字节")
+
+        img_fmt = _detect_image_format(image_data)
+        mime = "image/png" if img_fmt == "png" else "image/jpeg"
+        files = {"file": (f"image.{img_fmt}", image_data, mime)}
+        data = {"model": GITEE_OCR_MODEL}
+
+        resp = requests.post(submit_url, headers=auth_headers, files=files, data=data, timeout=120)
+        logger.info(f"OCR 任务提交状态码: {resp.status_code}")
+
+        if resp.status_code not in (200, 201):
+            logger.error(f"OCR 任务提交失败: {resp.status_code} - {resp.text[:500]}")
+            return None
+
+        result = resp.json()
+        task_id = result.get("task_id")
+        if not task_id:
+            logger.error(f"未获取到 task_id: {json.dumps(result, ensure_ascii=False)[:500]}")
+            return None
+
+        # 优先使用返回的轮询 URL
+        poll_url = (result.get("urls", {}).get("get")
+                    or f"https://ai.gitee.com/api/v1/task/{task_id}")
+        logger.info(f"OCR 任务已提交, task_id={task_id}, 轮询URL={poll_url}")
+
+        for i in range(60):
+            time.sleep(2)
+            pr = requests.get(poll_url, headers=auth_headers, timeout=30)
+            if pr.status_code != 200:
+                logger.warning(f"轮询第{i+1}次失败: {pr.status_code}")
+                continue
+
+            pr_result = pr.json()
+            status = pr_result.get("status", "unknown")
+            logger.info(f"轮询第{i+1}次, 状态: {status}")
+
+            if status in ("completed", "success"):
+                output = pr_result.get("output", {})
+                content = _extract_async_ocr_output(output)
+                logger.info(f"OCR 结果长度: {len(content)} 字符")
+
+                with open("debug_ocr_output.txt", "w", encoding="utf-8") as f:
+                    f.write(content)
+                logger.info("原始OCR输出已保存到 debug_ocr_output.txt")
+                return content
+
+            elif status in ("failed", "error", "cancelled"):
+                logger.error(f"OCR 任务失败: {json.dumps(pr_result, ensure_ascii=False)[:500]}")
+                return None
+
+        logger.error("OCR 任务超时（轮询次数耗尽）")
+        return None
+
     except Exception as e:
-        print(f"获取token失败: {e}")
+        logger.error(f"DeepSeek-OCR 调用异常: {e}")
         return None
 
 
-def process_single_table(cells):
-    """
-    处理单个表格的单元格数据
-    """
-    if not cells:
+def _extract_async_ocr_output(output):
+    """从异步任务 output.pages[].text_result 中提取文本。"""
+    if isinstance(output, dict):
+        pages = output.get("pages", [])
+        if pages:
+            parts = []
+            for page in pages:
+                text = page.get("text_result", "") if isinstance(page, dict) else str(page)
+                if text:
+                    parts.append(text)
+            return "\n".join(parts)
+        # fallback
+        return (output.get("text", "")
+                or output.get("markdown", "")
+                or output.get("content", "")
+                or json.dumps(output, ensure_ascii=False))
+    if isinstance(output, str):
+        return output
+    return str(output)
+
+
+def _extract_ocr_output(output):
+    """从异步任务 output 中提取文本内容。"""
+    if isinstance(output, str):
+        return output
+    if isinstance(output, dict):
+        return (output.get("text", "")
+                or output.get("markdown", "")
+                or output.get("content", "")
+                or json.dumps(output, ensure_ascii=False))
+    if isinstance(output, list):
+        parts = []
+        for item in output:
+            if isinstance(item, dict):
+                parts.append(item.get("text", "") or item.get("markdown", "") or json.dumps(item, ensure_ascii=False))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    return str(output)
+
+
+def parse_table_text_to_matrix(text):
+    """将 OCR 返回的表格文本（Markdown 或 HTML）解析为 List[List[str]] 矩阵。"""
+    if not text:
         return None
 
-    # 找出最大行和最大列，确定表格大小
-    max_row = max([cell['row_end'] for cell in cells]) + 1
-    max_col = max([cell['col_end'] for cell in cells]) + 1
+    # 尝试 HTML 表格解析
+    if "<table" in text.lower():
+        return _parse_html_table(text)
 
-    # 初始化一个空白矩阵
-    matrix = [["" for _ in range(max_col)] for _ in range(max_row)]
-
-    # 填充数据
-    for cell in cells:
-        r = cell['row_start']
-        c = cell['col_start']
-        text = cell['words']
-        matrix[r][c] = text
-
-    return matrix
+    # fallback: Markdown 解析
+    return _parse_markdown_table(text)
 
 
-def process_table_data(tables_result):
-    """
-    处理百度OCR返回的表格数据，支持多个表格
-    如果有多个表格，会尝试合并它们（假设表头相同）
-    """
-    if not tables_result:
-        return None
-
-    all_tables = []
-
-    # 处理所有识别到的表格
-    for table_idx, table_data in enumerate(tables_result):
-        cells = table_data.get('body', [])
+def _parse_html_table(html_text):
+    """解析 HTML <table> 为矩阵。"""
+    rows = []
+    for tr_match in re.finditer(r"<tr[^>]*>(.*?)</tr>", html_text, re.IGNORECASE | re.DOTALL):
+        tr_content = tr_match.group(1)
+        cells = []
+        for td_match in re.finditer(r"<t[dh][^>]*>(.*?)</t[dh]>", tr_content, re.IGNORECASE | re.DOTALL):
+            cell_text = re.sub(r"<[^>]+>", "", td_match.group(1)).strip()
+            cells.append(cell_text)
         if cells:
-            matrix = process_single_table(cells)
-            if matrix:
-                all_tables.append(matrix)
-                print(f"已识别表格 {table_idx + 1}: {len(matrix)} 行 x {len(matrix[0])} 列")
+            rows.append(cells)
 
-    if not all_tables:
+    if not rows:
         return None
 
-    # 如果只有一个表格，直接返回
-    if len(all_tables) == 1:
-        return all_tables[0]
+    max_cols = max(len(r) for r in rows)
+    for r in rows:
+        while len(r) < max_cols:
+            r.append("")
 
-    # 如果有多个表格，尝试合并它们
-    print(f"\n检测到 {len(all_tables)} 个表格，正在合并...")
-
-    # 假设所有表格的第一行都是表头，检查表头是否相同
-    headers = [table[0] for table in all_tables]
-
-    # 找出最长的表头
-    max_header = max(headers, key=len)
-
-    # 合并所有表格的数据（跳过表头，保留第一个表头）
-    merged_matrix = [max_header]  # 使用第一个表的表头
-
-    for table in all_tables:
-        # 添加每个表格的数据行（跳过表头行）
-        if len(table) > 1:
-            merged_matrix.extend(table[1:])
-
-    print(f"合并后: {len(merged_matrix)} 行 x {len(merged_matrix[0])} 列")
-    return merged_matrix
+    return rows
 
 
-def call_baidu_table_ocr(image_base64_str, access_token):
-    """调用百度表格OCR接口。"""
-    url = f"https://aip.baidubce.com/rest/2.0/ocr/v1/table?access_token={access_token}"
-    payload = {"image": image_base64_str}
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    response = requests.post(url, headers=headers, data=payload)
-    return response.json()
+def _parse_markdown_table(markdown_text):
+    """解析 Markdown 表格为矩阵。"""
+    lines = markdown_text.strip().split('\n')
+    rows = []
+    for line in lines:
+        line = line.strip()
+        if not line or not line.startswith('|'):
+            continue
+        if re.match(r'^\|[\s\-:]+\|$', line):
+            continue
+        parts = line.split('|')
+        if parts and parts[0] == '':
+            parts = parts[1:]
+        if parts and parts[-1] == '':
+            parts = parts[:-1]
+        cells = [p.strip() for p in parts]
+        if cells:
+            rows.append(cells)
+
+    if not rows:
+        return None
+
+    max_cols = max(len(r) for r in rows)
+    for r in rows:
+        while len(r) < max_cols:
+            r.append("")
+
+    return rows
 
 
 def extract_table_regions_with_ppstructure(image_data):
@@ -217,51 +297,52 @@ def merge_table_matrices(matrices):
     return merged
 
 
-def run_table_recognition_pipeline(image_data, access_token):
+def _detect_image_format(data):
+    """从图片二进制数据检测格式。"""
+    if data[:8] == b'\x89PNG\r\n\x1a\n':
+        return "png"
+    elif data[:2] == b'\xff\xd8':
+        return "jpeg"
+    return "jpeg"
+
+
+def run_table_recognition_pipeline(image_data):
     """
     识别主流程：
     1. PP-Structure 辅助切表
-    2. 百度 OCR 主识别
+    2. DeepSeek-OCR-2 主识别
     3. 失败/无区域时回退整图识别
     """
     regions, pp_meta = extract_table_regions_with_ppstructure(image_data)
     candidate_images = regions if regions else [image_data]
     fallback_used = not bool(regions)
-    combined_tables_result = []
     matrices = []
 
     for candidate in candidate_images:
-        base64_str = base64.b64encode(candidate).decode("utf-8")
-        result = call_baidu_table_ocr(base64_str, access_token)
-        tables_result = result.get("tables_result", [])
-        if tables_result:
-            combined_tables_result.extend(tables_result)
-            matrix = process_table_data(tables_result)
+        ocr_text = call_deepseek_ocr(candidate)
+        if ocr_text:
+            matrix = parse_table_text_to_matrix(ocr_text)
             if matrix:
                 matrices.append(matrix)
 
     if not matrices and regions:
-        # 区域识别均失败时，再尝试整图兜底一次
-        base64_str = base64.b64encode(image_data).decode("utf-8")
-        result = call_baidu_table_ocr(base64_str, access_token)
-        tables_result = result.get("tables_result", [])
-        if tables_result:
-            combined_tables_result.extend(tables_result)
-            matrix = process_table_data(tables_result)
+        ocr_text = call_deepseek_ocr(image_data)
+        if ocr_text:
+            matrix = parse_table_text_to_matrix(ocr_text)
             if matrix:
                 matrices.append(matrix)
                 fallback_used = True
 
     merged_matrix = merge_table_matrices(matrices)
     meta = {
-        "source_engine": "baidu_table_ocr",
+        "source_engine": "deepseek-ocr-2",
         "pp_structure": {
             **pp_meta,
             "fallback_used": fallback_used,
         },
         "candidate_count": len(candidate_images),
     }
-    return merged_matrix, {"tables_result": combined_tables_result}, meta
+    return merged_matrix, meta
 
 
 @app.post("/api/ocr")
@@ -273,11 +354,6 @@ async def ocr_table(file: UploadFile = File(...), enhance: bool = True):
     if not file.content_type.startswith('image/'):
         raise HTTPException(status_code=400, detail="只支持图片文件")
 
-    # 获取访问令牌
-    access_token = get_access_token()
-    if not access_token:
-        raise HTTPException(status_code=500, detail="获取OCR服务令牌失败")
-
     # 读取图片
     try:
         image_data = await file.read()
@@ -285,13 +361,13 @@ async def ocr_table(file: UploadFile = File(...), enhance: bool = True):
         raise HTTPException(status_code=400, detail=f"读取图片失败: {str(e)}")
 
     try:
-        data_matrix, result, recognition_meta = run_table_recognition_pipeline(image_data, access_token)
+        data_matrix, recognition_meta = run_table_recognition_pipeline(image_data)
         if data_matrix:
             # 如果启用LLM增强
             if enhance:
                 try:
                     # 先调用LLM增强整个表格
-                    enhanced_result = llm_enhancer.enhance_table_data(data_matrix, result)
+                    enhanced_result = llm_enhancer.enhance_table_data(data_matrix, None)
 
                     # 检查LLM增强后的表格是否有重复表头
                     enhanced_table = enhanced_result.get("enhanced_table", data_matrix)

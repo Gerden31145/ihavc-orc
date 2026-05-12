@@ -351,8 +351,11 @@ class LLMEnhancer:
     
     def _extract_ocr_context(self, ocr_result: Dict) -> str:
         """提取OCR结果的上下文信息"""
+        if not ocr_result:
+            return "无详细位置信息"
+
         context_parts = []
-        
+
         if "tables_result" in ocr_result:
             tables = ocr_result["tables_result"]
             for i, table in enumerate(tables):
@@ -362,7 +365,7 @@ class LLMEnhancer:
                         context_parts.append(
                             f"  位置({cell.get('row_start', '?')},{cell.get('col_start', '?')})-({cell.get('row_end', '?')},{cell.get('col_end', '?')}): {cell.get('words', '')}"
                         )
-        
+
         return "\n".join(context_parts) if context_parts else "无详细位置信息"
 
 
