@@ -384,6 +384,14 @@ def summarize_row_issues(table: Sequence[Sequence[str]], suspicious_rows: Sequen
     return issues
 
 
+def _cell_span_area(cell: Dict[str, Any]) -> int:
+    rs = int(cell.get("row_start", 0))
+    re = int(cell.get("row_end", rs))
+    cs = int(cell.get("col_start", 0))
+    ce = int(cell.get("col_end", cs))
+    return max(1, re - rs + 1) * max(1, ce - cs + 1)
+
+
 def build_table_from_cells(cells: Sequence[Dict[str, Any]]) -> List[List[str]]:
     if not cells:
         return []
@@ -392,12 +400,47 @@ def build_table_from_cells(cells: Sequence[Dict[str, Any]]) -> List[List[str]]:
     max_col = max(cell["col_end"] for cell in cells) + 1
     matrix = [["" for _ in range(max_col)] for _ in range(max_row)]
 
-    for cell in cells:
-        row_index = cell["row_start"]
-        column_index = cell["col_start"]
-        matrix[row_index][column_index] = normalize_cell_text(cell.get("words", ""))
+    # 百度合并格只在 (row_start, col_start) 给一份 words；若我们曾按 rowspan 向下复制，
+    # 多行会出现相同投档数字，与原书「一格占多行、不逐行重复」不一致。
+    # 横向 colspan 也不能铺到右侧，否则表头整行同字会触发 table_splitter 误判多表。
+    sorted_cells = sorted(cells, key=_cell_span_area, reverse=True)
+    for cell in sorted_cells:
+        text = normalize_cell_text(cell.get("words", ""))
+        if not text:
+            continue
+        rs = int(cell["row_start"])
+        cs = int(cell["col_start"])
+        if rs < max_row and cs < max_col:
+            matrix[rs][cs] = text
 
     return matrix
+
+
+def _expand_table_row_indices(indices: Sequence[int], margin: int = 2) -> set:
+    expanded: set = set()
+    for idx in indices:
+        for d in range(-margin, margin + 1):
+            v = idx + d
+            if v >= 0:
+                expanded.add(v)
+    return expanded
+
+
+def _cell_row_range(cell: Dict[str, Any]) -> Tuple[int, int]:
+    rs = cell.get("row_start")
+    if rs is None:
+        return (0, 0)
+    rs = int(rs)
+    re_raw = cell.get("row_end")
+    re = int(re_raw) if re_raw is not None else rs
+    return (rs, max(rs, re))
+
+
+def _cell_touches_rows(cell: Dict[str, Any], row_set: set) -> bool:
+    if not row_set:
+        return True
+    rs, re = _cell_row_range(cell)
+    return any(r in row_set for r in range(rs, re + 1))
 
 
 def compact_ocr_context(ocr_result: Dict[str, Any], focus_rows: Optional[Sequence[int]] = None) -> str:
@@ -405,20 +448,24 @@ def compact_ocr_context(ocr_result: Dict[str, Any], focus_rows: Optional[Sequenc
     if not tables:
         return ""
 
-    row_filter = set(focus_rows or [])
+    base_rows = set(int(r) for r in (focus_rows or []) if r is not None)
+    row_filter = _expand_table_row_indices(sorted(base_rows)) if base_rows else set()
     lines: List[str] = []
     for table_index, table in enumerate(tables, start=1):
         lines.append(f"table {table_index}:")
         for cell in table.get("body", []):
-            row_start = cell.get("row_start")
-            if row_filter and row_start not in row_filter:
+            if row_filter and not _cell_touches_rows(cell, row_filter):
                 continue
             value = normalize_cell_text(cell.get("words", ""))
             if not value:
                 continue
-            lines.append(
-                "  "
-                f"r{cell.get('row_start', '?')}c{cell.get('col_start', '?')}="
-                f"{value}"
-            )
-    return "\n".join(lines[:200])
+            rs, re = _cell_row_range(cell)
+            cs = int(cell.get("col_start", 0))
+            ce_raw = cell.get("col_end")
+            ce = int(ce_raw) if ce_raw is not None else cs
+            if re > rs or ce > cs:
+                span = f"r{rs}-{re}c{cs}-{ce}"
+            else:
+                span = f"r{rs}c{cs}"
+            lines.append(f"  {span}={value}")
+    return "\n".join(lines[:500])
