@@ -428,16 +428,27 @@ const startOcr = async () => {
   }
 }
 
+// CSV 单元格转义：含逗号、双引号或换行时用双引号包裹
+const escapeCsvCell = (cell: string) => {
+  if (/[",\r\n]/.test(cell)) {
+    return '"' + cell.replace(/"/g, '""') + '"'
+  }
+  return cell
+}
+
+const rowsToCsv = (headers: string[], rows: string[][]) => {
+  return [
+    headers.map(escapeCsvCell).join(','),
+    ...rows.map(row => row ? row.map(escapeCsvCell).join(',') : '')
+  ].join('\n')
+}
+
 // 导出CSV
 const exportCsv = () => {
   if (!tableData.headers || tableData.headers.length === 0) return
 
-  const csvContent = [
-    tableData.headers.join(','),
-    ...tableData.rows.map(row => row ? row.join(',') : '')
-  ].join('\n')
-
-  const blob = new Blob(['\ufeff' + csvContent], { type: 'text/csv;charset=utf-8;' })
+  const csvContent = rowsToCsv(tableData.headers, tableData.rows)
+  const blob = new Blob(['﻿' + csvContent], { type: 'text/csv;charset=utf-8;' })
   const link = document.createElement('a')
   link.href = URL.createObjectURL(blob)
   link.download = 'ocr_result.csv'
@@ -449,12 +460,8 @@ const exportSingleTableCsv = (tableIndex: number) => {
   if (!splitTables.value[tableIndex]) return
 
   const table = splitTables.value[tableIndex]
-  const csvContent = [
-    table.headers.join(','),
-    ...table.rows.map(row => row ? row.join(',') : '')
-  ].join('\n')
-
-  const blob = new Blob(['\ufeff' + csvContent], { type: 'text/csv;charset=utf-8;' })
+  const csvContent = rowsToCsv(table.headers, table.rows)
+  const blob = new Blob(['﻿' + csvContent], { type: 'text/csv;charset=utf-8;' })
   const link = document.createElement('a')
   link.href = URL.createObjectURL(blob)
   link.download = `ocr_result_table_${tableIndex + 1}.csv`
