@@ -13,23 +13,40 @@
           ref="fileInput"
           type="file"
           accept="image/*"
+          multiple
           @change="handleFileSelect"
           style="display: none"
         />
 
-        <div v-if="!previewImage" class="upload-placeholder">
+        <div v-if="previewImages.length === 0" class="upload-placeholder">
           <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" stroke-width="2"/>
             <polyline points="17 8 12 3 7 8" stroke-width="2"/>
             <line x1="12" y1="3" x2="12" y2="15" stroke-width="2"/>
           </svg>
           <p class="upload-text">点击或拖拽图片到此处</p>
-          <p class="upload-hint">支持 JPG、PNG 格式</p>
+          <p class="upload-hint">支持 JPG、PNG 格式，最多10张图片</p>
         </div>
 
-        <div v-else class="preview-container">
-          <img :src="previewImage" alt="预览图" class="preview-image" />
-          <button @click.stop="clearImage" class="clear-btn">×</button>
+        <div v-else class="preview-grid">
+          <div v-for="(preview, index) in previewImages" :key="index" class="preview-item">
+            <img :src="preview" alt="预览图" class="preview-thumb" />
+            <span class="preview-index">{{ index + 1 }}</span>
+            <div v-if="processingStatus[index] === 'processing'" class="thumb-overlay processing">
+              <div class="spinner-small"></div>
+            </div>
+            <div v-else-if="processingStatus[index] === 'done'" class="thumb-overlay done">&#10003;</div>
+            <div v-else-if="processingStatus[index] === 'error'" class="thumb-overlay error">&#10007;</div>
+            <button @click.stop="removeImage(index)" class="remove-btn">×</button>
+          </div>
+          <div v-if="previewImages.length < MAX_FILES" class="preview-item add-more" @click.stop="triggerFileInput">
+            <span>+</span>
+          </div>
+        </div>
+
+        <div v-if="isLoading" class="progress-bar-container">
+          <div class="progress-bar" :style="{ width: progressPercent + '%' }"></div>
+          <span class="progress-text">正在识别 {{ currentProcessingIndex + 1 }} / {{ selectedFiles.length }}...</span>
         </div>
 
         <div v-if="isLoading" class="loading-overlay">
@@ -38,7 +55,7 @@
         </div>
       </div>
 
-      <div v-if="previewImage && !isLoading" class="ocr-controls">
+      <div v-if="previewImages.length > 0 && !isLoading" class="ocr-controls">
         <div class="llm-toggle">
           <label class="toggle-label">
             <input type="checkbox" v-model="useLLMEnhancement" />
@@ -171,7 +188,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive } from 'vue'
+import { ref, reactive, computed } from 'vue'
 
 interface TableData {
   headers: string[]
@@ -185,11 +202,15 @@ interface SplitTable {
 
 const isDragOver = ref(false)
 const isLoading = ref(false)
-const previewImage = ref('')
 const errorMessage = ref('')
 const fileInput = ref<HTMLInputElement>()
-const selectedFile = ref<File | null>(null)
 const useLLMEnhancement = ref(true)
+
+const MAX_FILES = 10
+const selectedFiles = ref<File[]>([])
+const previewImages = ref<string[]>([])
+const processingStatus = ref<('pending' | 'processing' | 'done' | 'error')[]>([])
+const currentProcessingIndex = ref(-1)
 
 const tableData = reactive<TableData>({
   headers: [],
@@ -226,119 +247,184 @@ const triggerFileInput = () => {
 // 处理文件选择
 const handleFileSelect = (event: Event) => {
   const target = event.target as HTMLInputElement
-  const file = target.files?.[0]
-  if (file) {
-    processFile(file)
-  }
+  const files = target.files
+  if (!files) return
+  const fileArray = Array.from(files).slice(0, MAX_FILES)
+  processFiles(fileArray)
 }
 
 // 处理拖拽上传
 const handleDrop = (event: DragEvent) => {
   isDragOver.value = false
-  const file = event.dataTransfer?.files[0]
-  if (file && file.type.startsWith('image/')) {
-    processFile(file)
-  } else {
+  const files = event.dataTransfer?.files
+  if (!files) return
+  const imageFiles = Array.from(files).filter(f => f.type.startsWith('image/')).slice(0, MAX_FILES)
+  if (imageFiles.length === 0) {
     errorMessage.value = '请上传图片文件'
+    return
   }
+  processFiles(imageFiles)
 }
 
-// 处理文件
-const processFile = (file: File) => {
-  selectedFile.value = file
+// 处理多文件
+const processFiles = (files: File[]) => {
+  selectedFiles.value = files
+  previewImages.value = []
+  processingStatus.value = files.map(() => 'pending' as const)
   errorMessage.value = ''
 
-  // 创建预览
-  const reader = new FileReader()
-  reader.onload = (e) => {
-    previewImage.value = e.target?.result as string
-  }
-  reader.readAsDataURL(file)
+  files.forEach(file => {
+    const reader = new FileReader()
+    reader.onload = (e) => {
+      previewImages.value.push(e.target?.result as string)
+    }
+    reader.readAsDataURL(file)
+  })
 
-  // 清空之前的结果
   tableData.headers = []
   tableData.rows = []
+  splitTables.value = []
+  isSplit.value = false
 }
 
-// 清除图片
-const clearImage = () => {
-  previewImage.value = ''
-  selectedFile.value = null
+// 删除单张图片
+const removeImage = (index: number) => {
+  selectedFiles.value.splice(index, 1)
+  previewImages.value.splice(index, 1)
+  processingStatus.value.splice(index, 1)
+}
+
+// 清除所有图片
+const clearImages = () => {
+  if (fileInput.value) fileInput.value.value = ''
+  selectedFiles.value = []
+  previewImages.value = []
+  processingStatus.value = []
+  currentProcessingIndex.value = -1
   tableData.headers = []
   tableData.rows = []
   splitTables.value = []
   isSplit.value = false
   errorMessage.value = ''
 
-  // 重置增强信息
   enhancementInfo.applied = false
   enhancementInfo.corrections = []
   enhancementInfo.tableStructure = {}
   enhancementInfo.error = ''
 }
 
+// 判断是否为重复表头行
+const isHeaderRow = (row: string[], headers: string[]): boolean => {
+  if (row.length !== headers.length) return false
+  const matchCount = row.filter((cell, idx) =>
+    cell.trim() === headers[idx].trim()
+  ).length
+  return matchCount / headers.length > 0.8
+}
+
+// 计算进度百分比
+const progressPercent = computed(() => {
+  const done = processingStatus.value.filter(s => s === 'done' || s === 'error').length
+  return selectedFiles.value.length > 0 ? (done / selectedFiles.value.length) * 100 : 0
+})
+
 // 开始OCR识别
 const startOcr = async () => {
-  if (!selectedFile.value) {
+  if (selectedFiles.value.length === 0) {
     errorMessage.value = '请先选择图片'
     return
   }
 
   isLoading.value = true
   errorMessage.value = ''
-  
-  // 重置增强信息
+
   enhancementInfo.applied = false
   enhancementInfo.corrections = []
   enhancementInfo.tableStructure = {}
   enhancementInfo.error = ''
+  tableData.headers = []
+  tableData.rows = []
+  splitTables.value = []
+  isSplit.value = false
 
-  try {
-    const formData = new FormData()
-    formData.append('file', selectedFile.value)
+  const allRows: string[][] = []
+  let firstHeaders: string[] | null = null
+  let anyFailed = false
 
-    // 添加LLM增强参数
-    const url = `http://localhost:8000/api/ocr?enhance=${useLLMEnhancement.value}`
-    
-    const response = await fetch(url, {
-      method: 'POST',
-      body: formData
-    })
+  for (let i = 0; i < selectedFiles.value.length; i++) {
+    processingStatus.value[i] = 'processing'
+    currentProcessingIndex.value = i
 
-    const result = await response.json()
+    try {
+      const formData = new FormData()
+      formData.append('file', selectedFiles.value[i])
+      const url = `http://localhost:8000/api/ocr?enhance=${useLLMEnhancement.value}`
 
-    if (result.success) {
-      // 检查是否有多个表格
-      if (result.data.tables && result.data.tables.length > 0) {
-        // 多个拆分表格
-        splitTables.value = result.data.tables
-        isSplit.value = true
-        // 使用第一个表格作为默认显示（兼容旧逻辑）
-        tableData.headers = result.data.tables[0].headers
-        tableData.rows = result.data.tables[0].rows
+      const response = await fetch(url, {
+        method: 'POST',
+        body: formData
+      })
+
+      const result = await response.json()
+
+      if (result.success) {
+        let headers: string[]
+        let rows: string[][]
+
+        if (result.data.tables && result.data.tables.length > 0) {
+          headers = result.data.tables[0].headers
+          rows = result.data.tables.flatMap((t: any) => t.rows)
+        } else {
+          headers = result.data.headers
+          rows = result.data.rows
+        }
+
+        if (!firstHeaders) {
+          firstHeaders = headers
+        }
+
+        const normalizedRows = rows.map(row => {
+          const r = [...row]
+          while (r.length < firstHeaders!.length) r.push('')
+          return r.slice(0, firstHeaders!.length)
+        })
+
+        const filteredRows = normalizedRows.filter(row => !isHeaderRow(row, firstHeaders!))
+        allRows.push(...filteredRows)
+
+        processingStatus.value[i] = 'done'
+
+        if (result.enhancement) {
+          enhancementInfo.applied = enhancementInfo.applied || result.enhancement.applied
+          enhancementInfo.corrections.push(...(result.enhancement.corrections || []))
+          if (result.enhancement.tableStructure) {
+            enhancementInfo.tableStructure = result.enhancement.tableStructure
+          }
+          if (result.enhancement.error) {
+            enhancementInfo.error = result.enhancement.error
+          }
+        }
       } else {
-        // 单个表格
-        splitTables.value = []
-        isSplit.value = false
-        tableData.headers = result.data.headers
-        tableData.rows = result.data.rows
+        processingStatus.value[i] = 'error'
+        anyFailed = true
       }
-
-      // 保存增强信息
-      if (result.enhancement) {
-        enhancementInfo.applied = result.enhancement.applied
-        enhancementInfo.corrections = result.enhancement.corrections || []
-        enhancementInfo.tableStructure = result.enhancement.tableStructure || {}
-        enhancementInfo.error = result.enhancement.error || ''
-      }
-    } else {
-      errorMessage.value = result.error || '识别失败，请重试'
+    } catch (error) {
+      console.error('OCR请求失败:', error)
+      processingStatus.value[i] = 'error'
+      anyFailed = true
     }
-  } catch (error) {
-    console.error('OCR请求失败:', error)
-    errorMessage.value = '连接OCR服务失败，请确保后端服务已启动'
-  } finally {
-    isLoading.value = false
+  }
+
+  currentProcessingIndex.value = -1
+  isLoading.value = false
+
+  if (firstHeaders && allRows.length > 0) {
+    tableData.headers = firstHeaders
+    tableData.rows = allRows
+  } else if (anyFailed) {
+    errorMessage.value = '部分图片识别失败，请查看各图片状态'
+  } else {
+    errorMessage.value = '未能提取到有效表格内容'
   }
 }
 
@@ -433,32 +519,128 @@ const exportSingleTableCsv = (tableIndex: number) => {
   margin: 0;
 }
 
-.preview-container {
-  position: relative;
-  display: inline-block;
+.preview-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  justify-content: center;
+  padding: 1rem;
 }
 
-.preview-image {
-  max-width: 100%;
-  max-height: 400px;
+.preview-item {
+  position: relative;
+  width: 100px;
+  height: 100px;
+  border: 2px solid #e0e0e0;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.preview-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.preview-index {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  background: rgba(0,0,0,0.6);
+  color: white;
+  font-size: 0.7rem;
+  padding: 2px 6px;
   border-radius: 4px;
 }
 
-.clear-btn {
+.thumb-overlay {
   position: absolute;
-  top: -10px;
-  right: -10px;
-  width: 30px;
-  height: 30px;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.5rem;
+}
+
+.thumb-overlay.processing {
+  background: rgba(255,255,255,0.85);
+}
+
+.thumb-overlay.done {
+  background: rgba(76,175,80,0.2);
+  color: #4CAF50;
+}
+
+.thumb-overlay.error {
+  background: rgba(244,67,54,0.2);
+  color: #f44336;
+}
+
+.spinner-small {
+  width: 24px;
+  height: 24px;
+  border: 3px solid #f3f3f3;
+  border-top: 3px solid #4CAF50;
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+.add-more {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 2rem;
+  color: #999;
+  cursor: pointer;
+  border-style: dashed;
+}
+
+.add-more:hover {
+  border-color: #4CAF50;
+  color: #4CAF50;
+}
+
+.remove-btn {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 20px;
+  height: 20px;
   border-radius: 50%;
   border: none;
-  background: #ff4444;
+  background: rgba(255,0,0,0.7);
   color: white;
-  font-size: 20px;
+  font-size: 12px;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+.progress-bar-container {
+  position: relative;
+  height: 24px;
+  background: #f0f0f0;
+  border-radius: 12px;
+  overflow: hidden;
+  margin: 1rem 0;
+}
+
+.progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #4CAF50, #66BB6A);
+  border-radius: 12px;
+  transition: width 0.3s ease;
+}
+
+.progress-text {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.8rem;
+  color: #333;
 }
 
 .loading-overlay {
