@@ -358,7 +358,8 @@ const startOcr = async () => {
   const tasks = selectedFiles.value.map((file, i) => {
     const formData = new FormData()
     formData.append('file', file)
-    const url = `http://localhost:8000/api/ocr?enhance=${useLLMEnhancement.value}`
+    const baseUrl = import.meta.env.VITE_API_BASE_URL || ''
+    const url = `${baseUrl}/api/ocr?enhance=${useLLMEnhancement.value}`
     return fetch(url, { method: 'POST', body: formData })
       .then(res => res.json())
       .then(result => ({ index: i, result, fileName: file.name }))
