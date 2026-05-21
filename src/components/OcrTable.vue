@@ -295,25 +295,6 @@ const removeImage = (index: number) => {
   processingStatus.value.splice(index, 1)
 }
 
-// 清除所有图片
-const clearImages = () => {
-  if (fileInput.value) fileInput.value.value = ''
-  selectedFiles.value = []
-  previewImages.value = []
-  processingStatus.value = []
-  currentProcessingIndex.value = -1
-  tableData.headers = []
-  tableData.rows = []
-  splitTables.value = []
-  isSplit.value = false
-  errorMessage.value = ''
-
-  enhancementInfo.applied = false
-  enhancementInfo.corrections = []
-  enhancementInfo.tableStructure = {}
-  enhancementInfo.error = ''
-}
-
 // 判断是否为重复表头行
 const isHeaderRow = (row: string[], headers: string[]): boolean => {
   if (row.length !== headers.length) return false
