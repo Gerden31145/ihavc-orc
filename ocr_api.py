@@ -12,7 +12,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from llm_enhancer_v2 import LLMEnhancer
 from ocr_postprocess import build_table_from_cells, preprocess_image_for_ocr, repair_table_structure
 from ppstructure_engine import run_ppstructure
-from table_splitter import merge_split_results, split_table_by_repeated_headers
+from table_splitter import (
+    compress_repeated_header_columns,
+    ensure_table_has_header_row,
+    row_looks_like_score_header_labels,
+    split_table_by_repeated_headers,
+    strip_duplicate_header_rows,
+    _normalize_header_token,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -92,10 +99,16 @@ def process_table_data(tables_result: List[Dict[str, Any]]):
 
 
 def build_table_response(table: List[List[str]]) -> Dict[str, Any]:
-    return {
-        "headers": table[0] if table else [],
-        "rows": table[1:] if len(table) > 1 else [],
-    }
+    table = ensure_table_has_header_row(table)
+    compressed = compress_repeated_header_columns(table)
+    headers = compressed[0] if compressed else []
+    rows = compressed[1:] if len(compressed) > 1 else []
+    if not any(_normalize_header_token(h) for h in headers) and rows:
+        if row_looks_like_score_header_labels(rows[0]):
+            headers = rows[0]
+            rows = rows[1:]
+    rows = strip_duplicate_header_rows(headers, rows)
+    return {"headers": headers, "rows": rows}
 
 
 @app.post("/api/ocr")
@@ -215,22 +228,6 @@ async def ocr_table(file: UploadFile = File(...), enhance: bool = True, engine: 
 
     enhanced_table = final_result.get("enhanced_table", working_table)
     split_tables = split_table_by_repeated_headers(enhanced_table)
-    if len(split_tables) > 1:
-        final_result = merge_split_results(
-            [
-                {
-                    "enhanced_table": split_table,
-                    "corrections": final_result.get("corrections", []),
-                    "table_structure": {
-                        "headers": split_table[0] if split_table else [],
-                        "data_types": [],
-                        "estimated_columns": len(split_table[0]) if split_table else 0,
-                    },
-                }
-                for split_table in split_tables
-            ]
-        )
-        enhanced_table = final_result.get("enhanced_table", enhanced_table)
 
     enhancement_payload = {
         "applied": bool(final_result.get("diagnostics", {}).get("llm_used")),
@@ -246,8 +243,11 @@ async def ocr_table(file: UploadFile = File(...), enhance: bool = True, engine: 
         },
     }
 
-    if enhancement_payload["split_info"].get("was_split") and enhancement_payload["split_info"].get("table_count", 0) > 1:
-        split_tables = split_table_by_repeated_headers(enhanced_table)
+    if len(split_tables) > 1:
+        enhancement_payload["split_info"] = {
+            "was_split": True,
+            "table_count": len(split_tables),
+        }
         return {
             "success": True,
             "data": {

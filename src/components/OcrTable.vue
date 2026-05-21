@@ -13,29 +13,55 @@
           ref="fileInput"
           type="file"
           accept="image/*"
+          multiple
           @change="handleFileSelect"
           style="display: none"
         />
 
-        <div v-if="!previewImage" class="upload-placeholder">
+        <div v-if="imageQueue.length === 0" class="upload-placeholder">
           <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" stroke-width="2"/>
             <polyline points="17 8 12 3 7 8" stroke-width="2"/>
             <line x1="12" y1="3" x2="12" y2="15" stroke-width="2"/>
           </svg>
           <p class="upload-text">点击或拖拽图片到此处</p>
-          <p class="upload-hint">支持 JPG、PNG 格式</p>
+          <p class="upload-hint">支持 JPG、PNG，可多选或批量拖拽</p>
         </div>
 
         <div v-else class="preview-container">
           <img :src="previewImage" alt="预览图" class="preview-image" />
-          <button @click.stop="clearImage" class="clear-btn">×</button>
+          <button @click.stop="clearAllImages" class="clear-btn" title="清空全部">×</button>
         </div>
 
         <div v-if="isLoading" class="loading-overlay">
           <div class="spinner"></div>
-          <p>正在识别...</p>
+          <p>{{ batchProgressText }}</p>
         </div>
+      </div>
+
+      <div v-if="imageQueue.length > 0" class="batch-toolbar">
+        <span class="batch-count">已添加 {{ imageQueue.length }} 张图片</span>
+        <button type="button" class="link-btn" @click="triggerFileInput">继续添加</button>
+      </div>
+
+      <div v-if="imageQueue.length > 1" class="batch-thumbnails">
+        <button
+          v-for="item in imageQueue"
+          :key="item.id"
+          type="button"
+          class="thumb-item"
+          :class="{ active: item.id === activeItemId, [item.status]: true }"
+          @click="selectItem(item.id)"
+        >
+          <img :src="item.preview" :alt="item.file.name" />
+          <span class="thumb-name">{{ item.file.name }}</span>
+          <span class="thumb-status">{{ statusLabel(item.status) }}</span>
+          <span
+            class="thumb-remove"
+            @click.stop="removeItem(item.id)"
+            title="移除"
+          >×</span>
+        </button>
       </div>
 
       <div v-if="previewImage && !isLoading" class="ocr-controls">
@@ -53,7 +79,15 @@
           class="ocr-btn"
           :disabled="isLoading"
         >
-          {{ useLLMEnhancement ? '智能识别' : '开始识别' }}
+          {{ ocrButtonLabel }}
+        </button>
+        <button
+          v-if="hasAnySuccess"
+          type="button"
+          class="export-btn batch-export-btn"
+          @click="exportAllBatchCsv"
+        >
+          导出全部 CSV
         </button>
       </div>
     </div>
@@ -98,7 +132,7 @@
       <div class="table-header">
         <h3>{{ enhancementInfo.applied ? '智能识别结果' : '识别结果' }}</h3>
         <div class="table-actions">
-          <button @click="exportCsv" class="export-btn">导出 CSV</button>
+          <button @click="exportCsv" class="export-btn" :disabled="!canExport">导出 CSV</button>
         </div>
       </div>
 
@@ -131,14 +165,17 @@
     <div v-if="isSplit && splitTables.length > 0" class="tables-section">
       <div class="split-info-header">
         <h3>{{ enhancementInfo.applied ? '智能识别结果' : '识别结果' }}</h3>
-        <span class="split-badge">检测到 {{ splitTables.length }} 个表格</span>
+        <div class="split-header-actions">
+          <span class="split-badge">检测到 {{ splitTables.length }} 个表格</span>
+          <button @click="exportAllSplitTablesCsv" class="export-btn" :disabled="!canExport">合并导出 CSV</button>
+        </div>
       </div>
 
       <div v-for="(table, tableIndex) in splitTables" :key="tableIndex" class="table-section">
         <div class="table-header">
           <h4>表格 {{ tableIndex + 1 }}</h4>
           <div class="table-actions">
-            <button @click="exportSingleTableCsv(tableIndex)" class="export-btn">导出表格 {{ tableIndex + 1 }}</button>
+            <button @click="exportSingleTableCsv(tableIndex)" class="export-btn" :disabled="!canExport">导出表格 {{ tableIndex + 1 }}</button>
           </div>
         </div>
 
@@ -171,33 +208,26 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive } from 'vue'
+import { ref, reactive, computed } from 'vue'
+import {
+  tableToCsv,
+  mergeMultipleTablesCsv,
+  mergeSplitTablesCsv,
+  buildExportFilename,
+  downloadCsv,
+  sanitizeFilename,
+  ensureTableHeaders,
+  type TableExportData
+} from '../utils/csvExport'
+
+const fixTableForDisplay = (table: TableData): TableData => ensureTableHeaders(table)
 
 interface TableData {
   headers: string[]
   rows: string[][]
 }
 
-interface SplitTable {
-  headers: string[]
-  rows: string[][]
-}
-
-const isDragOver = ref(false)
-const isLoading = ref(false)
-const previewImage = ref('')
-const errorMessage = ref('')
-const fileInput = ref<HTMLInputElement>()
-const selectedFile = ref<File | null>(null)
-const useLLMEnhancement = ref(true)
-
-const tableData = reactive<TableData>({
-  headers: [],
-  rows: []
-})
-
-const splitTables = ref<SplitTable[]>([])
-const isSplit = ref(false)
+type BatchStatus = 'pending' | 'processing' | 'success' | 'error'
 
 interface Correction {
   original: string
@@ -211,168 +241,358 @@ interface TableStructure {
   estimated_columns?: number
 }
 
-const enhancementInfo = reactive({
+interface EnhancementState {
+  applied: boolean
+  corrections: Correction[]
+  tableStructure: TableStructure
+  error: string
+}
+
+interface BatchItem {
+  id: string
+  file: File
+  preview: string
+  status: BatchStatus
+  error?: string
+  isSplit: boolean
+  tableData: TableData
+  splitTables: TableData[]
+  enhancement: EnhancementState
+}
+
+const emptyEnhancement = (): EnhancementState => ({
   applied: false,
-  corrections: [] as Correction[],
-  tableStructure: {} as TableStructure,
+  corrections: [],
+  tableStructure: {},
   error: ''
 })
 
-// 触发文件选择
-const triggerFileInput = () => {
-  fileInput.value?.click()
+const isDragOver = ref(false)
+const isLoading = ref(false)
+const errorMessage = ref('')
+const fileInput = ref<HTMLInputElement>()
+const useLLMEnhancement = ref(true)
+const imageQueue = ref<BatchItem[]>([])
+const activeItemId = ref<string | null>(null)
+const batchProgress = ref({ current: 0, total: 0 })
+
+const tableData = reactive<TableData>({ headers: [], rows: [] })
+const splitTables = ref<TableData[]>([])
+const isSplit = ref(false)
+
+const enhancementInfo = reactive<EnhancementState>(emptyEnhancement())
+
+let idCounter = 0
+const nextId = () => `img-${Date.now()}-${++idCounter}`
+
+const activeItem = computed(() =>
+  imageQueue.value.find(i => i.id === activeItemId.value) ?? null
+)
+
+const previewImage = computed(() => activeItem.value?.preview ?? '')
+
+const batchProgressText = computed(() => {
+  if (batchProgress.value.total > 1) {
+    return `正在识别 ${batchProgress.value.current}/${batchProgress.value.total}...`
+  }
+  return '正在识别...'
+})
+
+const hasAnySuccess = computed(() =>
+  imageQueue.value.some(i => i.status === 'success')
+)
+
+const canExport = computed(() =>
+  tableData.headers.length > 0 || tableData.rows.length > 0
+)
+
+const ocrButtonLabel = computed(() => {
+  const base = useLLMEnhancement.value ? '智能识别' : '开始识别'
+  if (imageQueue.value.length > 1) return `批量${base}（${imageQueue.value.length} 张）`
+  return base
+})
+
+const statusLabel = (status: BatchStatus) => {
+  const map: Record<BatchStatus, string> = {
+    pending: '待识别',
+    processing: '识别中',
+    success: '已完成',
+    error: '失败'
+  }
+  return map[status]
 }
 
-// 处理文件选择
-const handleFileSelect = (event: Event) => {
-  const target = event.target as HTMLInputElement
-  const file = target.files?.[0]
-  if (file) {
-    processFile(file)
+const syncDisplayFromItem = (item: BatchItem | null) => {
+  if (!item) {
+    tableData.headers = []
+    tableData.rows = []
+    splitTables.value = []
+    isSplit.value = false
+    Object.assign(enhancementInfo, emptyEnhancement())
+    return
+  }
+  tableData.headers = [...item.tableData.headers]
+  tableData.rows = item.tableData.rows.map(r => [...r])
+  splitTables.value = item.splitTables.map(t => ({
+    headers: [...t.headers],
+    rows: t.rows.map(r => [...r])
+  }))
+  isSplit.value = item.isSplit
+  Object.assign(enhancementInfo, { ...item.enhancement })
+}
+
+const applyOcrResultToItem = (item: BatchItem, result: Record<string, unknown>) => {
+  const data = result.data as Record<string, unknown>
+  if (data.tables && Array.isArray(data.tables) && (data.tables as TableData[]).length > 0) {
+    const tables = (data.tables as TableData[]).map(fixTableForDisplay)
+    item.splitTables = tables
+    item.isSplit = true
+    item.tableData = {
+      headers: [...tables[0].headers],
+      rows: tables[0].rows.map(r => [...r])
+    }
+  } else {
+    item.splitTables = []
+    item.isSplit = false
+    item.tableData = fixTableForDisplay({
+      headers: [...(data.headers as string[])],
+      rows: (data.rows as string[][]).map(r => [...r])
+    })
+  }
+  const enh = result.enhancement as Record<string, unknown> | undefined
+  if (enh) {
+    item.enhancement = {
+      applied: Boolean(enh.applied),
+      corrections: (enh.corrections as Correction[]) || [],
+      tableStructure: (enh.tableStructure as TableStructure) || {},
+      error: (enh.error as string) || ''
+    }
+  } else {
+    item.enhancement = emptyEnhancement()
   }
 }
 
-// 处理拖拽上传
+const readFilePreview = (file: File): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = e => resolve(e.target?.result as string)
+    reader.onerror = () => reject(reader.error)
+    reader.readAsDataURL(file)
+  })
+
+const addFiles = async (files: FileList | File[]) => {
+  const imageFiles = Array.from(files).filter(f => f.type.startsWith('image/'))
+  if (!imageFiles.length) {
+    errorMessage.value = '请选择图片文件（JPG、PNG 等）'
+    return
+  }
+  errorMessage.value = ''
+
+  for (const file of imageFiles) {
+    const preview = await readFilePreview(file)
+    const item: BatchItem = {
+      id: nextId(),
+      file,
+      preview,
+      status: 'pending',
+      isSplit: false,
+      tableData: { headers: [], rows: [] },
+      splitTables: [],
+      enhancement: emptyEnhancement()
+    }
+    imageQueue.value.push(item)
+    if (!activeItemId.value) {
+      activeItemId.value = item.id
+      syncDisplayFromItem(item)
+    }
+  }
+}
+
+const triggerFileInput = () => fileInput.value?.click()
+
+const handleFileSelect = (event: Event) => {
+  const target = event.target as HTMLInputElement
+  if (target.files?.length) addFiles(target.files)
+  target.value = ''
+}
+
 const handleDrop = (event: DragEvent) => {
   isDragOver.value = false
-  const file = event.dataTransfer?.files[0]
-  if (file && file.type.startsWith('image/')) {
-    processFile(file)
+  const files = event.dataTransfer?.files
+  if (files?.length) {
+    addFiles(files)
   } else {
     errorMessage.value = '请上传图片文件'
   }
 }
 
-// 处理文件
-const processFile = (file: File) => {
-  selectedFile.value = file
-  errorMessage.value = ''
+const selectItem = (id: string) => {
+  activeItemId.value = id
+  syncDisplayFromItem(imageQueue.value.find(i => i.id === id) ?? null)
+}
 
-  // 创建预览
-  const reader = new FileReader()
-  reader.onload = (e) => {
-    previewImage.value = e.target?.result as string
+const removeItem = (id: string) => {
+  const idx = imageQueue.value.findIndex(i => i.id === id)
+  if (idx === -1) return
+  imageQueue.value.splice(idx, 1)
+  if (activeItemId.value === id) {
+    const next = imageQueue.value[Math.min(idx, imageQueue.value.length - 1)]
+    activeItemId.value = next?.id ?? null
+    syncDisplayFromItem(next ?? null)
   }
-  reader.readAsDataURL(file)
-
-  // 清空之前的结果
-  tableData.headers = []
-  tableData.rows = []
 }
 
-// 清除图片
-const clearImage = () => {
-  previewImage.value = ''
-  selectedFile.value = null
-  tableData.headers = []
-  tableData.rows = []
-  splitTables.value = []
-  isSplit.value = false
+const clearAllImages = () => {
+  imageQueue.value = []
+  activeItemId.value = null
+  syncDisplayFromItem(null)
   errorMessage.value = ''
-
-  // 重置增强信息
-  enhancementInfo.applied = false
-  enhancementInfo.corrections = []
-  enhancementInfo.tableStructure = {}
-  enhancementInfo.error = ''
+  if (fileInput.value) fileInput.value.value = ''
 }
 
-// 开始OCR识别
+const runOcrForFile = async (file: File) => {
+  const formData = new FormData()
+  formData.append('file', file)
+  const url = `http://localhost:8000/api/ocr?enhance=${useLLMEnhancement.value}`
+  const response = await fetch(url, { method: 'POST', body: formData })
+  return response.json()
+}
+
 const startOcr = async () => {
-  if (!selectedFile.value) {
-    errorMessage.value = '请先选择图片'
+  if (!imageQueue.value.length) {
+    errorMessage.value = '请先添加图片'
     return
   }
 
   isLoading.value = true
   errorMessage.value = ''
-  
-  // 重置增强信息
-  enhancementInfo.applied = false
-  enhancementInfo.corrections = []
-  enhancementInfo.tableStructure = {}
-  enhancementInfo.error = ''
+  const targets = imageQueue.value.filter(i => i.status !== 'success')
+  const toProcess = targets.length ? targets : imageQueue.value
+  batchProgress.value = { current: 0, total: toProcess.length }
 
-  try {
-    const formData = new FormData()
-    formData.append('file', selectedFile.value)
+  let failCount = 0
 
-    // 添加LLM增强参数
-    const url = `http://localhost:8000/api/ocr?enhance=${useLLMEnhancement.value}`
-    
-    const response = await fetch(url, {
-      method: 'POST',
-      body: formData
-    })
+  for (let i = 0; i < toProcess.length; i++) {
+    const item = toProcess[i]
+    batchProgress.value = { current: i + 1, total: toProcess.length }
+    item.status = 'processing'
+    item.error = undefined
+    selectItem(item.id)
 
-    const result = await response.json()
-
-    if (result.success) {
-      // 检查是否有多个表格
-      if (result.data.tables && result.data.tables.length > 0) {
-        // 多个拆分表格
-        splitTables.value = result.data.tables
-        isSplit.value = true
-        // 使用第一个表格作为默认显示（兼容旧逻辑）
-        tableData.headers = result.data.tables[0].headers
-        tableData.rows = result.data.tables[0].rows
+    try {
+      const result = await runOcrForFile(item.file)
+      if (result.success) {
+        applyOcrResultToItem(item, result)
+        item.status = 'success'
+        syncDisplayFromItem(item)
       } else {
-        // 单个表格
-        splitTables.value = []
-        isSplit.value = false
-        tableData.headers = result.data.headers
-        tableData.rows = result.data.rows
+        item.status = 'error'
+        item.error = result.error || '识别失败'
+        failCount++
       }
-
-      // 保存增强信息
-      if (result.enhancement) {
-        enhancementInfo.applied = result.enhancement.applied
-        enhancementInfo.corrections = result.enhancement.corrections || []
-        enhancementInfo.tableStructure = result.enhancement.tableStructure || {}
-        enhancementInfo.error = result.enhancement.error || ''
-      }
-    } else {
-      errorMessage.value = result.error || '识别失败，请重试'
+    } catch (error) {
+      console.error('OCR请求失败:', error)
+      item.status = 'error'
+      item.error = '连接OCR服务失败'
+      failCount++
     }
-  } catch (error) {
-    console.error('OCR请求失败:', error)
-    errorMessage.value = '连接OCR服务失败，请确保后端服务已启动'
-  } finally {
-    isLoading.value = false
+  }
+
+  isLoading.value = false
+  batchProgress.value = { current: 0, total: 0 }
+
+  if (failCount === toProcess.length) {
+    errorMessage.value = '全部识别失败，请检查后端服务或图片质量'
+  } else if (failCount > 0) {
+    errorMessage.value = `${failCount} 张图片识别失败，可在缩略图上查看状态`
   }
 }
 
-// 导出CSV
-const exportCsv = () => {
-  if (!tableData.headers || tableData.headers.length === 0) return
-
-  const csvContent = [
-    tableData.headers.join(','),
-    ...tableData.rows.map(row => row ? row.join(',') : '')
-  ].join('\n')
-
-  const blob = new Blob(['\ufeff' + csvContent], { type: 'text/csv;charset=utf-8;' })
-  const link = document.createElement('a')
-  link.href = URL.createObjectURL(blob)
-  link.download = 'ocr_result.csv'
-  link.click()
+const sourceBaseName = () => {
+  const name = activeItem.value?.file.name ?? 'ocr_result'
+  return sanitizeFilename(name.replace(/\.[^.]+$/, ''))
 }
 
-// 导出单个表格CSV
+const exportCsv = () => {
+  if (!canExport.value) return
+  const meta = imageQueue.value.length > 1
+    ? { headers: ['来源文件'], values: [activeItem.value?.file.name ?? ''] }
+    : undefined
+  downloadCsv(
+    tableToCsv(tableData, meta),
+    buildExportFilename(sourceBaseName())
+  )
+}
+
 const exportSingleTableCsv = (tableIndex: number) => {
-  if (!splitTables.value[tableIndex]) return
-
   const table = splitTables.value[tableIndex]
-  const csvContent = [
-    table.headers.join(','),
-    ...table.rows.map(row => row ? row.join(',') : '')
-  ].join('\n')
+  if (!table?.headers.length && !table?.rows.length) return
+  const meta = imageQueue.value.length > 1
+    ? { headers: ['来源文件'], values: [activeItem.value?.file.name ?? ''] }
+    : undefined
+  downloadCsv(
+    tableToCsv(table, meta),
+    buildExportFilename(`${sourceBaseName()}_table${tableIndex + 1}`)
+  )
+}
 
-  const blob = new Blob(['\ufeff' + csvContent], { type: 'text/csv;charset=utf-8;' })
-  const link = document.createElement('a')
-  link.href = URL.createObjectURL(blob)
-  link.download = `ocr_result_table_${tableIndex + 1}.csv`
-  link.click()
+const exportAllSplitTablesCsv = () => {
+  if (!splitTables.value.length) return
+  const meta = imageQueue.value.length > 1
+    ? { headers: ['来源文件'], values: [activeItem.value?.file.name ?? ''] }
+    : undefined
+  downloadCsv(
+    mergeSplitTablesCsv(splitTables.value, meta),
+    buildExportFilename(`${sourceBaseName()}_merged`)
+  )
+}
+
+const exportAllBatchCsv = () => {
+  const successItems = imageQueue.value.filter(
+    i => i.status === 'success' && (i.tableData.headers.length || i.tableData.rows.length || i.splitTables.length)
+  )
+  if (!successItems.length) return
+
+  if (successItems.length === 1) {
+    const item = successItems[0]
+    const meta = { headers: ['来源文件'], values: [item.file.name] }
+    if (item.isSplit && item.splitTables.length) {
+      downloadCsv(
+        mergeSplitTablesCsv(item.splitTables, meta),
+        buildExportFilename(item.file.name.replace(/\.[^.]+$/, ''))
+      )
+    } else {
+      downloadCsv(
+        tableToCsv(item.tableData, meta),
+        buildExportFilename(item.file.name.replace(/\.[^.]+$/, ''))
+      )
+    }
+    return
+  }
+
+  const hasSplit = successItems.some(i => i.isSplit && i.splitTables.length > 1)
+  const metaHeaders = hasSplit ? ['来源文件', '子表格'] : ['来源文件']
+  const sections: { metaValues?: string[]; table: TableExportData }[] = []
+
+  for (const item of successItems) {
+    if (item.isSplit && item.splitTables.length) {
+      for (let t = 0; t < item.splitTables.length; t++) {
+        sections.push({
+          metaValues: hasSplit
+            ? [item.file.name, `表格${t + 1}`]
+            : [item.file.name],
+          table: item.splitTables[t]
+        })
+      }
+    } else {
+      sections.push({
+        metaValues: [item.file.name],
+        table: item.tableData
+      })
+    }
+  }
+
+  downloadCsv(mergeMultipleTablesCsv(sections, metaHeaders), buildExportFilename('batch_ocr'))
 }
 </script>
 
@@ -431,6 +651,107 @@ const exportSingleTableCsv = (tableIndex: number) => {
   font-size: 0.9rem;
   color: #999;
   margin: 0;
+}
+
+.batch-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 0.75rem;
+  font-size: 0.9rem;
+  color: #555;
+}
+
+.link-btn {
+  background: none;
+  border: none;
+  color: #2196F3;
+  cursor: pointer;
+  font-size: 0.9rem;
+  padding: 0;
+}
+
+.link-btn:hover {
+  text-decoration: underline;
+}
+
+.batch-thumbnails {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 1rem;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.thumb-item {
+  position: relative;
+  width: 100px;
+  padding: 0.35rem;
+  border: 2px solid #e0e0e0;
+  border-radius: 8px;
+  background: #fff;
+  cursor: pointer;
+  text-align: center;
+  transition: border-color 0.2s;
+}
+
+.thumb-item:hover,
+.thumb-item.active {
+  border-color: #4CAF50;
+}
+
+.thumb-item.success { border-color: #81c784; }
+.thumb-item.error { border-color: #e57373; }
+.thumb-item.processing { border-color: #ffb74d; }
+
+.thumb-item img {
+  width: 100%;
+  height: 56px;
+  object-fit: cover;
+  border-radius: 4px;
+}
+
+.thumb-name {
+  display: block;
+  font-size: 0.65rem;
+  color: #333;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-top: 0.25rem;
+}
+
+.thumb-status {
+  display: block;
+  font-size: 0.6rem;
+  color: #888;
+}
+
+.thumb-remove {
+  position: absolute;
+  top: 2px;
+  right: 4px;
+  color: #999;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.thumb-remove:hover {
+  color: #f44336;
+}
+
+.batch-export-btn {
+  align-self: flex-start;
+}
+
+.export-btn:disabled {
+  background: #bdbdbd;
+  cursor: not-allowed;
+}
+
+.export-btn:disabled:hover {
+  background: #bdbdbd;
 }
 
 .preview-container {
@@ -604,6 +925,7 @@ const exportSingleTableCsv = (tableIndex: number) => {
   display: flex;
   flex-direction: column;
   gap: 1rem;
+  flex-wrap: wrap;
 }
 
 .llm-toggle {
@@ -778,6 +1100,12 @@ const exportSingleTableCsv = (tableIndex: number) => {
 .split-info-header h3 {
   margin: 0;
   color: #7b1fa2;
+}
+
+.split-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
 }
 
 .split-badge {
