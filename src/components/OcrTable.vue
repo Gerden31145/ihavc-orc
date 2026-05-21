@@ -58,7 +58,7 @@
       <div v-if="previewImages.length > 0 && !isLoading" class="ocr-controls">
         <div class="llm-toggle">
           <label class="toggle-label">
-            <input type="checkbox" v-model="useLLMEnhancement" />
+            <input type="checkbox" :checked="useLLMEnhancement" @change="onLLMToggleChange" />
             <span class="toggle-slider"></span>
             <span class="toggle-text">启用LLM智能增强</span>
           </label>
@@ -204,7 +204,7 @@ const isDragOver = ref(false)
 const isLoading = ref(false)
 const errorMessage = ref('')
 const fileInput = ref<HTMLInputElement>()
-const useLLMEnhancement = ref(true)
+const useLLMEnhancement = ref(false)
 
 const MAX_FILES = 10
 const selectedFiles = ref<File[]>([])
@@ -328,6 +328,19 @@ const progressPercent = computed(() => {
   const done = processingStatus.value.filter(s => s === 'done' || s === 'error').length
   return selectedFiles.value.length > 0 ? (done / selectedFiles.value.length) * 100 : 0
 })
+
+// LLM增强开关切换确认
+const onLLMToggleChange = (event: Event) => {
+  const checked = (event.target as HTMLInputElement).checked
+  if (checked) {
+    const confirmed = confirm('LLM智能增强为测试功能，可能会产生错误识别结果，是否确认开启？')
+    if (!confirmed) {
+      ;(event.target as HTMLInputElement).checked = false
+      return
+    }
+  }
+  useLLMEnhancement.value = checked
+}
 
 // 开始OCR识别
 const startOcr = async () => {
