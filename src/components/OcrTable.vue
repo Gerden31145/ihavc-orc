@@ -211,6 +211,7 @@ const selectedFiles = ref<File[]>([])
 const previewImages = ref<string[]>([])
 const processingStatus = ref<('pending' | 'processing' | 'done' | 'error')[]>([])
 const currentProcessingIndex = ref(-1)
+const failedImageNames = ref<string[]>([])
 
 const tableData = reactive<TableData>({
   headers: [],
@@ -337,6 +338,7 @@ const startOcr = async () => {
 
   isLoading.value = true
   errorMessage.value = ''
+  failedImageNames.value = []
 
   enhancementInfo.applied = false
   enhancementInfo.corrections = []
@@ -349,69 +351,70 @@ const startOcr = async () => {
 
   const allRows: string[][] = []
   let firstHeaders: string[] | null = null
-  let anyFailed = false
+  const failedIndices: number[] = []
 
-  for (let i = 0; i < selectedFiles.value.length; i++) {
-    processingStatus.value[i] = 'processing'
-    currentProcessingIndex.value = i
+  // 并行发起所有 OCR 请求
+  processingStatus.value = selectedFiles.value.map(() => 'processing')
+  const tasks = selectedFiles.value.map((file, i) => {
+    const formData = new FormData()
+    formData.append('file', file)
+    const url = `http://localhost:8000/api/ocr?enhance=${useLLMEnhancement.value}`
+    return fetch(url, { method: 'POST', body: formData })
+      .then(res => res.json())
+      .then(result => ({ index: i, result, fileName: file.name }))
+      .catch(error => {
+        console.error(`第 ${i + 1} 张图片 OCR 请求失败:`, error)
+        return ({ index: i, result: null, fileName: file.name })
+      })
+  })
 
-    try {
-      const formData = new FormData()
-      formData.append('file', selectedFiles.value[i])
-      const url = `http://localhost:8000/api/ocr?enhance=${useLLMEnhancement.value}`
+  const settled = await Promise.allSettled(tasks)
 
-      const response = await fetch(url, {
-        method: 'POST',
-        body: formData
+  for (const entry of settled) {
+    if (entry.status === 'rejected') continue
+    const { index: i, result, fileName } = entry.value
+
+    if (result && result.success) {
+      let headers: string[]
+      let rows: string[][]
+
+      if (result.data.tables && result.data.tables.length > 0) {
+        headers = result.data.tables[0].headers
+        rows = result.data.tables.flatMap((t: any) => t.rows)
+      } else {
+        headers = result.data.headers
+        rows = result.data.rows
+      }
+
+      if (!firstHeaders) {
+        firstHeaders = headers
+      }
+
+      const normalizedRows = rows.map(row => {
+        const r = [...row]
+        while (r.length < firstHeaders!.length) r.push('')
+        return r.slice(0, firstHeaders!.length)
       })
 
-      const result = await response.json()
+      const filteredRows = normalizedRows.filter(row => !isHeaderRow(row, firstHeaders!))
+      allRows.push(...filteredRows)
 
-      if (result.success) {
-        let headers: string[]
-        let rows: string[][]
+      processingStatus.value[i] = 'done'
 
-        if (result.data.tables && result.data.tables.length > 0) {
-          headers = result.data.tables[0].headers
-          rows = result.data.tables.flatMap((t: any) => t.rows)
-        } else {
-          headers = result.data.headers
-          rows = result.data.rows
+      if (result.enhancement) {
+        enhancementInfo.applied = enhancementInfo.applied || result.enhancement.applied
+        enhancementInfo.corrections.push(...(result.enhancement.corrections || []))
+        if (result.enhancement.tableStructure) {
+          enhancementInfo.tableStructure = result.enhancement.tableStructure
         }
-
-        if (!firstHeaders) {
-          firstHeaders = headers
+        if (result.enhancement.error) {
+          enhancementInfo.error = result.enhancement.error
         }
-
-        const normalizedRows = rows.map(row => {
-          const r = [...row]
-          while (r.length < firstHeaders!.length) r.push('')
-          return r.slice(0, firstHeaders!.length)
-        })
-
-        const filteredRows = normalizedRows.filter(row => !isHeaderRow(row, firstHeaders!))
-        allRows.push(...filteredRows)
-
-        processingStatus.value[i] = 'done'
-
-        if (result.enhancement) {
-          enhancementInfo.applied = enhancementInfo.applied || result.enhancement.applied
-          enhancementInfo.corrections.push(...(result.enhancement.corrections || []))
-          if (result.enhancement.tableStructure) {
-            enhancementInfo.tableStructure = result.enhancement.tableStructure
-          }
-          if (result.enhancement.error) {
-            enhancementInfo.error = result.enhancement.error
-          }
-        }
-      } else {
-        processingStatus.value[i] = 'error'
-        anyFailed = true
       }
-    } catch (error) {
-      console.error('OCR请求失败:', error)
+    } else {
       processingStatus.value[i] = 'error'
-      anyFailed = true
+      failedIndices.push(i)
+      failedImageNames.value.push(fileName)
     }
   }
 
@@ -421,15 +424,21 @@ const startOcr = async () => {
   if (firstHeaders && allRows.length > 0) {
     tableData.headers = firstHeaders
     tableData.rows = allRows
-  } else if (anyFailed) {
-    errorMessage.value = '部分图片识别失败，请查看各图片状态'
+    if (failedIndices.length > 0) {
+      errorMessage.value = `第 ${failedIndices.map(i => i + 1).join('、')} 张图片识别失败（${failedImageNames.value.join('、')}），已跳过并合并其余结果`
+    }
+  } else if (failedIndices.length > 0) {
+    errorMessage.value = `所有图片均识别失败（${failedImageNames.value.join('、')}），请检查图片是否清晰`
   } else {
     errorMessage.value = '未能提取到有效表格内容'
   }
 }
 
-// CSV 单元格转义：含逗号、双引号或换行时用双引号包裹
+// CSV 单元格转义：数字强制为字符串（防止前导零丢失），含逗号、双引号或换行时用双引号包裹
 const escapeCsvCell = (cell: string) => {
+  if (/^\d+(\.\d+)?$/.test(cell)) {
+    return '="' + cell + '"'
+  }
   if (/[",\r\n]/.test(cell)) {
     return '"' + cell.replace(/"/g, '""') + '"'
   }
