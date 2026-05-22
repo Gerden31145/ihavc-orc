@@ -86,9 +86,6 @@ def call_deepseek_ocr(image_data):
                 content = _extract_async_ocr_output(output)
                 logger.info(f"OCR 结果长度: {len(content)} 字符")
 
-                with open("debug_ocr_output.txt", "w", encoding="utf-8") as f:
-                    f.write(content)
-                logger.info("原始OCR输出已保存到 debug_ocr_output.txt")
                 return content
 
             elif status in ("failed", "error", "cancelled"):
