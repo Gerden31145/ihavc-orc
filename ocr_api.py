@@ -4,8 +4,8 @@ import base64
 import io
 import json
 import re
-import time
-import requests
+import asyncio
+import httpx
 import uvicorn
 import logging
 from llm_enhancer import LLMEnhancer
@@ -39,7 +39,7 @@ llm_enhancer = LLMEnhancer(api_key=DEEPSEEK_API_KEY)
 _pp_structure_engine = None
 
 
-def call_deepseek_ocr(image_data):
+async def call_deepseek_ocr(image_data):
     """调用 Gitee AI DeepSeek-OCR 异步文档解析，返回识别文本。"""
     submit_url = f"{GITEE_BASE_URL}/async/documents/parse"
     auth_headers = {"Authorization": f"Bearer {GITEE_API_KEY}"}
@@ -52,7 +52,8 @@ def call_deepseek_ocr(image_data):
         files = {"file": (f"image.{img_fmt}", image_data, mime)}
         data = {"model": GITEE_OCR_MODEL}
 
-        resp = requests.post(submit_url, headers=auth_headers, files=files, data=data, timeout=120)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+            resp = await client.post(submit_url, headers=auth_headers, files=files, data=data)
         logger.info(f"OCR 任务提交状态码: {resp.status_code}")
 
         if resp.status_code not in (200, 201):
@@ -65,32 +66,32 @@ def call_deepseek_ocr(image_data):
             logger.error(f"未获取到 task_id: {json.dumps(result, ensure_ascii=False)[:500]}")
             return None
 
-        # 优先使用返回的轮询 URL
         poll_url = (result.get("urls", {}).get("get")
                     or f"https://ai.gitee.com/api/v1/task/{task_id}")
         logger.info(f"OCR 任务已提交, task_id={task_id}, 轮询URL={poll_url}")
 
-        for i in range(60):
-            time.sleep(2)
-            pr = requests.get(poll_url, headers=auth_headers, timeout=30)
-            if pr.status_code != 200:
-                logger.warning(f"轮询第{i+1}次失败: {pr.status_code}")
-                continue
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            for i in range(60):
+                await asyncio.sleep(2)
+                pr = await client.get(poll_url, headers=auth_headers)
+                if pr.status_code != 200:
+                    logger.warning(f"轮询第{i+1}次失败: {pr.status_code}")
+                    continue
 
-            pr_result = pr.json()
-            status = pr_result.get("status", "unknown")
-            logger.info(f"轮询第{i+1}次, 状态: {status}")
+                pr_result = pr.json()
+                status = pr_result.get("status", "unknown")
+                logger.info(f"轮询第{i+1}次, 状态: {status}")
 
-            if status in ("completed", "success"):
-                output = pr_result.get("output", {})
-                content = _extract_async_ocr_output(output)
-                logger.info(f"OCR 结果长度: {len(content)} 字符")
+                if status in ("completed", "success"):
+                    output = pr_result.get("output", {})
+                    content = _extract_async_ocr_output(output)
+                    logger.info(f"OCR 结果长度: {len(content)} 字符")
 
-                return content
+                    return content
 
-            elif status in ("failed", "error", "cancelled"):
-                logger.error(f"OCR 任务失败: {json.dumps(pr_result, ensure_ascii=False)[:500]}")
-                return None
+                elif status in ("failed", "error", "cancelled"):
+                    logger.error(f"OCR 任务失败: {json.dumps(pr_result, ensure_ascii=False)[:500]}")
+                    return None
 
         logger.error("OCR 任务超时（轮询次数耗尽）")
         return None
@@ -303,7 +304,7 @@ def _detect_image_format(data):
     return "jpeg"
 
 
-def run_table_recognition_pipeline(image_data):
+async def run_table_recognition_pipeline(image_data):
     """
     识别主流程：
     1. PP-Structure 辅助切表
@@ -316,14 +317,14 @@ def run_table_recognition_pipeline(image_data):
     matrices = []
 
     for candidate in candidate_images:
-        ocr_text = call_deepseek_ocr(candidate)
+        ocr_text = await call_deepseek_ocr(candidate)
         if ocr_text:
             matrix = parse_table_text_to_matrix(ocr_text)
             if matrix:
                 matrices.append(matrix)
 
     if not matrices and regions:
-        ocr_text = call_deepseek_ocr(image_data)
+        ocr_text = await call_deepseek_ocr(image_data)
         if ocr_text:
             matrix = parse_table_text_to_matrix(ocr_text)
             if matrix:
@@ -358,7 +359,7 @@ async def ocr_table(file: UploadFile = File(...), enhance: bool = True):
         raise HTTPException(status_code=400, detail=f"读取图片失败: {str(e)}")
 
     try:
-        data_matrix, recognition_meta = run_table_recognition_pipeline(image_data)
+        data_matrix, recognition_meta = await run_table_recognition_pipeline(image_data)
         if data_matrix:
             # 如果启用LLM增强
             if enhance:
