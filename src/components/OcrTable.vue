@@ -45,8 +45,14 @@
         </div>
 
         <div v-if="isLoading" class="progress-bar-container">
-          <div class="progress-bar" :style="{ width: progressPercent + '%' }"></div>
-          <span class="progress-text">正在识别 {{ currentProcessingIndex + 1 }} / {{ selectedFiles.length }}...</span>
+          <template v-if="crossPageMode && selectedFiles.length > 1">
+            <div class="progress-bar indeterminate"></div>
+            <span class="progress-text">正在跨页识别合并...</span>
+          </template>
+          <template v-else>
+            <div class="progress-bar" :style="{ width: progressPercent + '%' }"></div>
+            <span class="progress-text">正在识别 {{ currentProcessingIndex + 1 }} / {{ selectedFiles.length }}...</span>
+          </template>
         </div>
 
         <div v-if="isLoading" class="loading-overlay">
@@ -64,13 +70,22 @@
           </label>
           <span class="toggle-hint">使用AI纠正识别错误，完善表格结构</span>
         </div>
+
+        <div v-if="selectedFiles.length > 1" class="llm-toggle">
+          <label class="toggle-label">
+            <input type="checkbox" v-model="crossPageMode" />
+            <span class="toggle-slider"></span>
+            <span class="toggle-text">跨页表格合并</span>
+          </label>
+          <span class="toggle-hint">同一表格跨越多页时，按顺序合并识别结果</span>
+        </div>
         
         <button
           @click="startOcr"
           class="ocr-btn"
           :disabled="isLoading"
         >
-          {{ useLLMEnhancement ? '智能识别' : '开始识别' }}
+          {{ crossPageMode && selectedFiles.length > 1 ? (useLLMEnhancement ? '跨页智能合并' : '跨页合并识别') : (useLLMEnhancement ? '智能识别' : '开始识别') }}
         </button>
       </div>
     </div>
@@ -205,6 +220,7 @@ const isLoading = ref(false)
 const errorMessage = ref('')
 const fileInput = ref<HTMLInputElement>()
 const useLLMEnhancement = ref(false)
+const crossPageMode = ref(false)
 
 const MAX_FILES = 10
 const selectedFiles = ref<File[]>([])
@@ -343,11 +359,19 @@ const startOcr = async () => {
   splitTables.value = []
   isSplit.value = false
 
+  if (crossPageMode.value && selectedFiles.value.length > 1) {
+    await startCrossPageOcr()
+  } else {
+    await startParallelOcr()
+  }
+}
+
+// 并行识别（原有逻辑）
+const startParallelOcr = async () => {
   const allRows: string[][] = []
   let firstHeaders: string[] | null = null
   const failedIndices: number[] = []
 
-  // 并行发起所有 OCR 请求
   processingStatus.value = selectedFiles.value.map(() => 'processing')
   const tasks = selectedFiles.value.map((file, i) => {
     const formData = new FormData()
@@ -426,6 +450,56 @@ const startOcr = async () => {
     errorMessage.value = `所有图片均识别失败（${failedImageNames.value.join('、')}），请检查图片是否清晰`
   } else {
     errorMessage.value = '未能提取到有效表格内容'
+  }
+}
+
+// 跨页合并识别
+const startCrossPageOcr = async () => {
+  processingStatus.value = selectedFiles.value.map(() => 'processing')
+
+  const formData = new FormData()
+  selectedFiles.value.forEach(file => {
+    formData.append('files', file)
+  })
+
+  const baseUrl = import.meta.env.VITE_API_BASE_URL || ''
+  const url = `${baseUrl}/api/ocr-batch?enhance=${useLLMEnhancement.value}`
+
+  try {
+    const response = await fetch(url, { method: 'POST', body: formData })
+    const result = await response.json()
+
+    if (result.success) {
+      processingStatus.value = processingStatus.value.map(() => 'done')
+
+      if (result.data.tables && result.data.tables.length > 0) {
+        splitTables.value = result.data.tables
+        isSplit.value = true
+      } else {
+        tableData.headers = result.data.headers || []
+        tableData.rows = result.data.rows || []
+      }
+
+      if (result.enhancement) {
+        enhancementInfo.applied = result.enhancement.applied
+        enhancementInfo.corrections = result.enhancement.corrections || []
+        enhancementInfo.tableStructure = result.enhancement.table_structure || {}
+        enhancementInfo.error = result.enhancement.error || ''
+      }
+
+      if (result.data.meta?.merge_diagnostics?.warnings?.length > 0) {
+        errorMessage.value = result.data.meta.merge_diagnostics.warnings.join('; ')
+      }
+    } else {
+      processingStatus.value = processingStatus.value.map(() => 'error')
+      errorMessage.value = result.error || '批量识别失败'
+    }
+  } catch (error) {
+    processingStatus.value = processingStatus.value.map(() => 'error')
+    errorMessage.value = `请求失败: ${error}`
+  } finally {
+    currentProcessingIndex.value = -1
+    isLoading.value = false
   }
 }
 
@@ -680,6 +754,16 @@ const exportSingleTableCsv = (tableIndex: number) => {
 @keyframes spin {
   0% { transform: rotate(0deg); }
   100% { transform: rotate(360deg); }
+}
+
+.progress-bar.indeterminate {
+  width: 30% !important;
+  animation: indeterminate-slide 1.5s ease-in-out infinite;
+}
+
+@keyframes indeterminate-slide {
+  0% { margin-left: -30%; }
+  100% { margin-left: 100%; }
 }
 
 .ocr-btn {

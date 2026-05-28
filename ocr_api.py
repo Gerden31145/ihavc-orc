@@ -1,3 +1,4 @@
+from typing import List
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import base64
@@ -10,6 +11,7 @@ import uvicorn
 import logging
 from llm_enhancer import LLMEnhancer
 from table_splitter import split_table_by_repeated_headers, merge_split_results
+from cross_page_merger import merge_cross_page_tables
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -340,6 +342,128 @@ async def ocr_table(file: UploadFile = File(...), enhance: bool = True):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"OCR服务调用失败: {str(e)}")
+
+
+@app.post("/api/ocr-batch")
+async def ocr_batch(files: List[UploadFile] = File(...), enhance: bool = True):
+    """
+    批量OCR：按顺序识别多张图片，智能合并跨页表格。
+    """
+    # 验证所有文件
+    for f in files:
+        if not f.content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail=f"不支持的文件类型: {f.filename}")
+
+    # 读取所有图片
+    images: List[bytes] = []
+    for f in files:
+        try:
+            images.append(await f.read())
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"读取图片失败: {str(e)}")
+
+    try:
+        # 按顺序逐张识别
+        page_matrices: List[list | None] = []
+        for idx, img_data in enumerate(images):
+            if idx > 0:
+                await asyncio.sleep(0.5)
+            logger.info(f"批量OCR: 正在处理第{idx+1}/{len(images)}张图片")
+            matrix, _ = await run_table_recognition_pipeline(img_data)
+            page_matrices.append(matrix)
+
+        # 合并跨页表格
+        merged = merge_cross_page_tables(page_matrices)
+        headers = merged["headers"]
+        rows = merged["rows"]
+        diagnostics = merged["merge_diagnostics"]
+
+        if not headers:
+            return {"success": False, "error": "未能提取到有效表格内容"}
+
+        data_matrix = [headers] + rows
+
+        # LLM 增强（复用 /api/ocr 的逻辑）
+        if enhance:
+            try:
+                enhanced_result = llm_enhancer.enhance_table_data(data_matrix, None)
+                enhanced_table = enhanced_result.get("enhanced_table", data_matrix)
+
+                if enhanced_table and len(enhanced_table) > 0:
+                    split_tables = split_table_by_repeated_headers(enhanced_table)
+
+                    if len(split_tables) > 1:
+                        split_results = []
+                        for st in split_tables:
+                            split_results.append({
+                                "enhanced_table": st,
+                                "corrections": enhanced_result.get("corrections", []),
+                                "table_structure": {
+                                    "headers": st[0] if st else [],
+                                    "data_types": [],
+                                    "estimated_columns": len(st[0]) if st else 0,
+                                },
+                            })
+                        enhanced_result = merge_split_results(split_results)
+
+                enhanced_table = enhanced_result.get("enhanced_table", data_matrix)
+                split_info = enhanced_result.get("split_info", {})
+
+                if split_info.get("was_split") and split_info.get("table_count", 0) > 1:
+                    final_tables = split_table_by_repeated_headers(enhanced_table)
+                    return {
+                        "success": True,
+                        "data": {
+                            "tables": [
+                                {"headers": t[0] if t else [], "rows": t[1:] if len(t) > 1 else []}
+                                for t in final_tables
+                            ],
+                            "is_split": True,
+                            "table_count": len(final_tables),
+                            "meta": {"source_engine": "glm-ocr", "merge_diagnostics": diagnostics},
+                        },
+                        "enhancement": {
+                            "applied": True,
+                            "corrections": enhanced_result.get("corrections", []),
+                            "table_structure": enhanced_result.get("table_structure", {}),
+                            "split_info": split_info,
+                            "error": enhanced_result.get("error"),
+                        },
+                    }
+
+                return {
+                    "success": True,
+                    "data": {
+                        "headers": enhanced_table[0] if enhanced_table else [],
+                        "rows": enhanced_table[1:] if len(enhanced_table) > 1 else [],
+                        "original_headers": headers,
+                        "original_rows": rows,
+                        "meta": {"source_engine": "glm-ocr", "merge_diagnostics": diagnostics},
+                    },
+                    "enhancement": {
+                        "applied": True,
+                        "corrections": enhanced_result.get("corrections", []),
+                        "table_structure": enhanced_result.get("table_structure", {}),
+                        "split_info": split_info,
+                        "error": enhanced_result.get("error"),
+                    },
+                }
+            except Exception as e:
+                logger.warning(f"批量OCR LLM增强失败: {e}")
+
+        # 无 LLM 增强
+        return {
+            "success": True,
+            "data": {
+                "headers": headers,
+                "rows": rows,
+                "meta": {"source_engine": "glm-ocr", "merge_diagnostics": diagnostics},
+            },
+            "enhancement": {"applied": False},
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"批量OCR服务调用失败: {str(e)}")
 
 
 @app.post("/api/synthesize")
