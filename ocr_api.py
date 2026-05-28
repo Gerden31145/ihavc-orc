@@ -26,120 +26,94 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Gitee AI DeepSeek-OCR-2 配置
-GITEE_API_KEY = "YNDQSJY1R3VRLUVZTW12OCWFUFBLXBGVZ5ATDUZ4"
-GITEE_BASE_URL = "https://ai.gitee.com/v1"
-GITEE_OCR_MODEL = "DeepSeek-OCR"
+# GLM-OCR 配置
+GLM_API_KEY = "c44dfa4e72224ccbb0e0eb497cf58bcb.JneopyysoxFdcx2U"
+GLM_OCR_URL = "https://open.bigmodel.cn/api/paas/v4/layout_parsing"
+GLM_OCR_MODEL = "glm-ocr"
 
 # DeepSeek LLM API信息
 DEEPSEEK_API_KEY = "sk-d114b6faaa5942969eaaba903080c713"
 
 # 初始化LLM增强器
 llm_enhancer = LLMEnhancer(api_key=DEEPSEEK_API_KEY)
-_pp_structure_engine = None
 
 
-async def call_deepseek_ocr(image_data):
-    """调用 Gitee AI DeepSeek-OCR 异步文档解析，返回识别文本。"""
-    submit_url = f"{GITEE_BASE_URL}/async/documents/parse"
-    auth_headers = {"Authorization": f"Bearer {GITEE_API_KEY}"}
-
+async def call_glm_ocr(image_data):
+    """调用智谱 GLM-OCR 同步文档解析，返回识别文本。遇到 429 自动重试。"""
+    max_retries = 3
     try:
-        logger.info(f"提交 OCR 任务: {submit_url}, 图片大小: {len(image_data)} 字节")
-
         img_fmt = _detect_image_format(image_data)
-        mime = "image/png" if img_fmt == "png" else "image/jpeg"
-        files = {"file": (f"image.{img_fmt}", image_data, mime)}
-        data = {"model": GITEE_OCR_MODEL}
+        b64 = base64.b64encode(image_data).decode("utf-8")
+        file_url = f"data:image/{img_fmt};base64,{b64}"
+
+        payload = {"model": GLM_OCR_MODEL, "file": file_url}
+        headers = {
+            "Authorization": f"Bearer {GLM_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        logger.info(f"调用 GLM-OCR, 图片大小: {len(image_data)} 字节")
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
-            resp = await client.post(submit_url, headers=auth_headers, files=files, data=data)
-        logger.info(f"OCR 任务提交状态码: {resp.status_code}")
+            for attempt in range(max_retries):
+                resp = await client.post(GLM_OCR_URL, headers=headers, json=payload)
+                logger.info(f"GLM-OCR 状态码: {resp.status_code}")
 
-        if resp.status_code not in (200, 201):
-            logger.error(f"OCR 任务提交失败: {resp.status_code} - {resp.text[:500]}")
-            return None
+                if resp.status_code == 200:
+                    break
 
-        result = resp.json()
-        task_id = result.get("task_id")
-        if not task_id:
-            logger.error(f"未获取到 task_id: {json.dumps(result, ensure_ascii=False)[:500]}")
-            return None
-
-        poll_url = (result.get("urls", {}).get("get")
-                    or f"https://ai.gitee.com/api/v1/task/{task_id}")
-        logger.info(f"OCR 任务已提交, task_id={task_id}, 轮询URL={poll_url}")
-
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
-            for i in range(60):
-                await asyncio.sleep(2)
-                pr = await client.get(poll_url, headers=auth_headers)
-                if pr.status_code != 200:
-                    logger.warning(f"轮询第{i+1}次失败: {pr.status_code}")
+                if resp.status_code == 429 and attempt < max_retries - 1:
+                    wait = 3 * (attempt + 1)
+                    logger.warning(f"GLM-OCR 限流(429), 第{attempt+1}次重试, 等待{wait}秒...")
+                    await asyncio.sleep(wait)
                     continue
 
-                pr_result = pr.json()
-                status = pr_result.get("status", "unknown")
-                logger.info(f"轮询第{i+1}次, 状态: {status}")
+                logger.error(f"GLM-OCR 调用失败: {resp.status_code} - {resp.text[:500]}")
+                return None
 
-                if status in ("completed", "success"):
-                    output = pr_result.get("output", {})
-                    content = _extract_async_ocr_output(output)
-                    logger.info(f"OCR 结果长度: {len(content)} 字符")
-
-                    return content
-
-                elif status in ("failed", "error", "cancelled"):
-                    logger.error(f"OCR 任务失败: {json.dumps(pr_result, ensure_ascii=False)[:500]}")
-                    return None
-
-        logger.error("OCR 任务超时（轮询次数耗尽）")
-        return None
+        result = resp.json()
+        content = _extract_glm_ocr_content(result)
+        logger.info(f"GLM-OCR 结果长度: {len(content)} 字符")
+        return content
 
     except Exception as e:
-        logger.error(f"DeepSeek-OCR 调用异常: {e}")
+        logger.error(f"GLM-OCR 调用异常: {e}")
         return None
 
 
-def _extract_async_ocr_output(output):
-    """从异步任务 output.pages[].text_result 中提取文本。"""
-    if isinstance(output, dict):
-        pages = output.get("pages", [])
-        if pages:
+def _extract_glm_ocr_content(result):
+    """从 GLM-OCR 响应中提取文本内容。"""
+    if isinstance(result, dict):
+        # 优先取 md_results（HTML/Markdown 格式）
+        md = result.get("md_results", "")
+        if md:
+            return md
+        # layout_details 中各区域的 content
+        layout = result.get("layout_details", [])
+        if isinstance(layout, list) and layout:
             parts = []
-            for page in pages:
-                text = page.get("text_result", "") if isinstance(page, dict) else str(page)
-                if text:
-                    parts.append(text)
-            return "\n".join(parts)
-        # fallback
-        return (output.get("text", "")
-                or output.get("markdown", "")
-                or output.get("content", "")
-                or json.dumps(output, ensure_ascii=False))
-    if isinstance(output, str):
-        return output
-    return str(output)
-
-
-def _extract_ocr_output(output):
-    """从异步任务 output 中提取文本内容。"""
-    if isinstance(output, str):
-        return output
-    if isinstance(output, dict):
-        return (output.get("text", "")
-                or output.get("markdown", "")
-                or output.get("content", "")
-                or json.dumps(output, ensure_ascii=False))
-    if isinstance(output, list):
-        parts = []
-        for item in output:
-            if isinstance(item, dict):
-                parts.append(item.get("text", "") or item.get("markdown", "") or json.dumps(item, ensure_ascii=False))
-            else:
-                parts.append(str(item))
-        return "\n".join(parts)
-    return str(output)
+            for page in layout:
+                if isinstance(page, list):
+                    for block in page:
+                        if isinstance(block, dict):
+                            content = block.get("content", "")
+                            if content:
+                                parts.append(content)
+                elif isinstance(page, dict):
+                    content = page.get("content", "")
+                    if content:
+                        parts.append(content)
+            if parts:
+                return "\n".join(parts)
+        # 其他 fallback
+        for key in ("content", "text", "markdown", "output"):
+            val = result.get(key, "")
+            if val:
+                return val if isinstance(val, str) else json.dumps(val, ensure_ascii=False)
+        return json.dumps(result, ensure_ascii=False)
+    if isinstance(result, str):
+        return result
+    return str(result)
 
 
 def parse_table_text_to_matrix(text):
@@ -208,93 +182,6 @@ def _parse_markdown_table(markdown_text):
     return rows
 
 
-def extract_table_regions_with_ppstructure(image_data):
-    """
-    使用 PP-Structure 提取表格区域。
-    返回: (regions, meta)
-      regions: list[bytes]，每个元素是裁剪后的图片字节
-      meta: 辅助诊断信息
-    """
-    global _pp_structure_engine
-    meta = {
-        "enabled": False,
-        "available": False,
-        "region_count": 0,
-        "fallback_reason": "",
-        "error": None,
-    }
-
-    try:
-        import cv2
-        import numpy as np
-        from paddleocr import PPStructure
-    except Exception as exc:
-        meta["fallback_reason"] = "pp_structure_not_installed"
-        meta["error"] = str(exc)
-        return [], meta
-
-    meta["available"] = True
-
-    try:
-        if _pp_structure_engine is None:
-            _pp_structure_engine = PPStructure(show_log=False, layout=False, ocr=False)
-
-        image_np = cv2.imdecode(np.frombuffer(image_data, np.uint8), cv2.IMREAD_COLOR)
-        if image_np is None:
-            meta["fallback_reason"] = "invalid_image"
-            return [], meta
-
-        result = _pp_structure_engine(image_np)
-        regions = []
-        height, width = image_np.shape[:2]
-        for block in result:
-            if block.get("type") != "table":
-                continue
-            bbox = block.get("bbox") or []
-            if len(bbox) != 4:
-                continue
-            x1, y1, x2, y2 = [int(v) for v in bbox]
-            x1 = max(0, min(x1, width - 1))
-            x2 = max(0, min(x2, width))
-            y1 = max(0, min(y1, height - 1))
-            y2 = max(0, min(y2, height))
-            if x2 <= x1 or y2 <= y1:
-                continue
-            crop = image_np[y1:y2, x1:x2]
-            ok, encoded = cv2.imencode(".png", crop)
-            if ok:
-                regions.append(encoded.tobytes())
-
-        meta["enabled"] = True
-        meta["region_count"] = len(regions)
-        if not regions:
-            meta["fallback_reason"] = "no_table_region_detected"
-        return regions, meta
-    except Exception as exc:
-        meta["enabled"] = True
-        meta["fallback_reason"] = "pp_structure_runtime_error"
-        meta["error"] = str(exc)
-        return [], meta
-
-
-def merge_table_matrices(matrices):
-    """合并多个矩阵表，沿用最长表头并拼接数据行。"""
-    if not matrices:
-        return None
-    if len(matrices) == 1:
-        return matrices[0]
-
-    headers = [table[0] for table in matrices if table]
-    if not headers:
-        return None
-    max_header = max(headers, key=len)
-    merged = [max_header]
-    for table in matrices:
-        if table and len(table) > 1:
-            merged.extend(table[1:])
-    return merged
-
-
 def _detect_image_format(data):
     """从图片二进制数据检测格式。"""
     if data[:8] == b'\x89PNG\r\n\x1a\n':
@@ -307,40 +194,15 @@ def _detect_image_format(data):
 async def run_table_recognition_pipeline(image_data):
     """
     识别主流程：
-    1. PP-Structure 辅助切表
-    2. DeepSeek-OCR-2 主识别
-    3. 失败/无区域时回退整图识别
+    1. GLM-OCR 主识别
     """
-    regions, pp_meta = extract_table_regions_with_ppstructure(image_data)
-    candidate_images = regions if regions else [image_data]
-    fallback_used = not bool(regions)
-    matrices = []
+    ocr_text = await call_glm_ocr(image_data)
+    matrix = parse_table_text_to_matrix(ocr_text) if ocr_text else None
 
-    for candidate in candidate_images:
-        ocr_text = await call_deepseek_ocr(candidate)
-        if ocr_text:
-            matrix = parse_table_text_to_matrix(ocr_text)
-            if matrix:
-                matrices.append(matrix)
-
-    if not matrices and regions:
-        ocr_text = await call_deepseek_ocr(image_data)
-        if ocr_text:
-            matrix = parse_table_text_to_matrix(ocr_text)
-            if matrix:
-                matrices.append(matrix)
-                fallback_used = True
-
-    merged_matrix = merge_table_matrices(matrices)
     meta = {
-        "source_engine": "deepseek-ocr-2",
-        "pp_structure": {
-            **pp_meta,
-            "fallback_used": fallback_used,
-        },
-        "candidate_count": len(candidate_images),
+        "source_engine": "glm-ocr",
     }
-    return merged_matrix, meta
+    return matrix, meta
 
 
 @app.post("/api/ocr")
