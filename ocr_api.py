@@ -12,6 +12,7 @@ import logging
 from llm_enhancer import LLMEnhancer
 from table_splitter import split_table_by_repeated_headers, merge_split_results
 from cross_page_merger import merge_cross_page_tables
+from ocr_postprocess import repair_table_structure
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -197,12 +198,28 @@ async def run_table_recognition_pipeline(image_data):
     """
     识别主流程：
     1. GLM-OCR 主识别
+    2. 表格结构修复（投档线/排位拆分等）
     """
     ocr_text = await call_glm_ocr(image_data)
     matrix = parse_table_text_to_matrix(ocr_text) if ocr_text else None
 
+    # 表格结构修复：拆分粘连表头、粘连数字等
+    repair_corrections = []
+    if matrix:
+        logger.info(f"[DEBUG] repair 前 headers: {matrix[0] if matrix else 'N/A'}")
+        for i, row in enumerate(matrix[:4]):
+            logger.info(f"[DEBUG] repair 前 row[{i}]: {row}")
+        repair_result = repair_table_structure(matrix)
+        matrix = repair_result["table"]
+        repair_corrections = repair_result.get("corrections", [])
+        if repair_corrections:
+            logger.info(f"表格结构修复: {len(repair_corrections)} 项修正")
+        else:
+            logger.info(f"[DEBUG] repair 未产生任何修正, numeric_columns={repair_result.get('numeric_columns')}")
+
     meta = {
         "source_engine": "glm-ocr",
+        "repair_corrections": repair_corrections,
     }
     return matrix, meta
 
@@ -230,6 +247,12 @@ async def ocr_table(file: UploadFile = File(...), enhance: bool = True):
                 try:
                     # 先调用LLM增强整个表格
                     enhanced_result = llm_enhancer.enhance_table_data(data_matrix, None)
+
+                    # 合并结构修复的 corrections
+                    if recognition_meta.get("repair_corrections"):
+                        if "corrections" not in enhanced_result:
+                            enhanced_result["corrections"] = []
+                        enhanced_result["corrections"] = recognition_meta["repair_corrections"] + enhanced_result["corrections"]
 
                     # 检查LLM增强后的表格是否有重复表头
                     enhanced_table = enhanced_result.get("enhanced_table", data_matrix)
@@ -365,12 +388,15 @@ async def ocr_batch(files: List[UploadFile] = File(...), enhance: bool = True):
     try:
         # 按顺序逐张识别
         page_matrices: List[list | None] = []
+        all_repair_corrections = []
         for idx, img_data in enumerate(images):
             if idx > 0:
                 await asyncio.sleep(0.5)
             logger.info(f"批量OCR: 正在处理第{idx+1}/{len(images)}张图片")
-            matrix, _ = await run_table_recognition_pipeline(img_data)
+            matrix, page_meta = await run_table_recognition_pipeline(img_data)
             page_matrices.append(matrix)
+            if page_meta.get("repair_corrections"):
+                all_repair_corrections.extend(page_meta["repair_corrections"])
 
         # 合并跨页表格
         merged = merge_cross_page_tables(page_matrices)
@@ -388,6 +414,12 @@ async def ocr_batch(files: List[UploadFile] = File(...), enhance: bool = True):
             try:
                 enhanced_result = llm_enhancer.enhance_table_data(data_matrix, None)
                 enhanced_table = enhanced_result.get("enhanced_table", data_matrix)
+
+                # 合并结构修复的 corrections
+                if all_repair_corrections:
+                    if "corrections" not in enhanced_result:
+                        enhanced_result["corrections"] = []
+                    enhanced_result["corrections"] = all_repair_corrections + enhanced_result["corrections"]
 
                 if enhanced_table and len(enhanced_table) > 0:
                     split_tables = split_table_by_repeated_headers(enhanced_table)
