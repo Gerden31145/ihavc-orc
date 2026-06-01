@@ -206,16 +206,11 @@ async def run_table_recognition_pipeline(image_data):
     # 表格结构修复：拆分粘连表头、粘连数字等
     repair_corrections = []
     if matrix:
-        logger.info(f"[DEBUG] repair 前 headers: {matrix[0] if matrix else 'N/A'}")
-        for i, row in enumerate(matrix[:4]):
-            logger.info(f"[DEBUG] repair 前 row[{i}]: {row}")
         repair_result = repair_table_structure(matrix)
         matrix = repair_result["table"]
         repair_corrections = repair_result.get("corrections", [])
         if repair_corrections:
             logger.info(f"表格结构修复: {len(repair_corrections)} 项修正")
-        else:
-            logger.info(f"[DEBUG] repair 未产生任何修正, numeric_columns={repair_result.get('numeric_columns')}")
 
     meta = {
         "source_engine": "glm-ocr",

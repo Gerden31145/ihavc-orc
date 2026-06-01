@@ -223,6 +223,46 @@ def _is_rank_header(text: str) -> bool:
     return "排位" in header or "位次" in header or "排名" in header
 
 
+def _count_filled(row: Sequence[str]) -> int:
+    """Count non-empty cells in a row."""
+    return sum(1 for cell in row if normalize_cell_text(cell))
+
+
+def _flatten_multirow_headers(table: List[List[str]], corrections: List[Dict[str, str]]) -> List[List[str]]:
+    """
+    Detect and remove GLM-OCR outer frame rows.
+
+    GLM-OCR returns tables where the outer frame label (e.g. "本科") sits
+    in row[0] with mostly empty cells, while the real column names are in
+    row[1].  This simply drops the sparse row[0] and promotes row[1] to header.
+
+    Detection heuristic:
+      - row[0] has ≤ 50% filled cells
+      - row[1] has ≥ 67% filled cells
+    """
+    if len(table) < 2:
+        return table
+
+    row0 = table[0]
+    row1 = table[1]
+    row0_total = max(len(row0), 1)
+    row1_total = max(len(row1), 1)
+    row0_filled = _count_filled(row0)
+    row1_filled = _count_filled(row1)
+
+    # row[0] mostly empty, row[1] mostly full → drop row[0]
+    if row0_filled > row0_total // 2 or row1_filled < row1_total * 2 // 3:
+        return table
+
+    corrections.append({
+        "original": str(row0),
+        "corrected": "dropped",
+        "reason": "removed sparse outer frame row, promoted row[1] to header",
+    })
+
+    return table[1:]
+
+
 def repair_table_structure(table: List[List[str]]) -> Dict[str, Any]:
     if not table:
         return {
@@ -234,6 +274,16 @@ def repair_table_structure(table: List[List[str]]) -> Dict[str, Any]:
 
     repaired = [[normalize_cell_text(cell) for cell in row] for row in table]
     corrections: List[Dict[str, str]] = []
+
+    # Step -1: flatten multi-row headers (GLM-OCR outer frame + real headers)
+    repaired = _flatten_multirow_headers(repaired, corrections)
+
+    # Save original header (before Step 0 modifies it) for Step 2 matching.
+    # Repeated headers in data will match this pre-split version, not the
+    # post-split header — which is exactly what we need for reliable detection.
+    original_header: List[str] = (
+        [normalize_cell_text(c) for c in repaired[0]] if repaired else []
+    )
 
     # Step 0: split sticky headers — scan ALL rows (not just row 0),
     # because GLM-OCR may produce multi-row headers where the real
@@ -405,6 +455,43 @@ def repair_table_structure(table: List[List[str]]) -> Dict[str, Any]:
         )
         if blank_numeric_count:
             suspicious_rows.add(row_index)
+
+    # Step 2: remove repeated header rows within data
+    # GLM-OCR may produce tables where (sparse row + header row) reappears
+    # in the middle of data.  Use SET-based comparison (ignoring column
+    # alignment) because Step 0 may have inserted columns that shift data.
+    if len(repaired) >= 3 and original_header:
+        orig_values = set(
+            normalize_cell_text(c) for c in original_header
+            if normalize_cell_text(c)
+        )
+        if orig_values:
+            rows_to_remove: List[int] = []
+            for row_idx in range(1, len(repaired)):
+                row = repaired[row_idx]
+                row_values = set(
+                    normalize_cell_text(c) for c in row
+                    if normalize_cell_text(c)
+                )
+                if not row_values:
+                    continue
+                overlap = len(orig_values & row_values) / len(orig_values)
+                if overlap >= 0.7:
+                    # Also remove preceding sparse row (outer frame label)
+                    if row_idx > 1:
+                        prev = repaired[row_idx - 1]
+                        if _count_filled(prev) <= max(len(prev), 1) // 2:
+                            rows_to_remove.append(row_idx - 1)
+                    rows_to_remove.append(row_idx)
+
+            if rows_to_remove:
+                for idx in reversed(sorted(set(rows_to_remove))):
+                    removed = repaired.pop(idx)
+                    corrections.append({
+                        "original": str(removed),
+                        "corrected": "removed",
+                        "reason": f"removed repeated header row at row {idx + 1}",
+                    })
 
     return {
         "table": repaired,
