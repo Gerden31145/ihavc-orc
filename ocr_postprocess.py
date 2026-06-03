@@ -140,6 +140,11 @@ def infer_numeric_columns(table: Sequence[Sequence[str]]) -> List[int]:
 _ALPHANUMERIC_CODE_RE = re.compile(r"^[a-zA-Z]+\d+$|^\d+[a-zA-Z]+$")
 
 
+def _has_cjk(text: str) -> bool:
+    """Return True if *text* contains CJK ideographs (meaningful Chinese text)."""
+    return bool(re.search(r"[一-鿿]", text))
+
+
 def normalize_numeric_text(text: str) -> str:
     normalized = normalize_cell_text(text)
     if not normalized:
@@ -147,7 +152,11 @@ def normalize_numeric_text(text: str) -> str:
     tokens = extract_numeric_tokens(normalized)
     if not tokens:
         return normalized
-    if "\n" in normalized or " " in normalized:
+    # If the cell contains CJK characters (e.g. "567（男）"), the text is
+    # meaningful annotation — don't strip it down to bare digits.
+    if _has_cjk(normalized):
+        return normalized
+    if "\n" in normalized or " " in normalized or "/" in normalized:
         return "\n".join(tokens)
     # Don't strip letter prefixes from alphanumeric codes like "A1", "B2"
     compact = re.sub(r"\s+", "", normalized)
@@ -192,14 +201,34 @@ def _split_sticky_header_cell(header: str) -> Optional[Tuple[str, str]]:
 def _split_packed_score_rank(value: str) -> Optional[Tuple[str, str]]:
     """
     Split a packed numeric token like "55469531" into ("554", "69531") when plausible.
+    Also handles annotated values like "588(男)36108(男)" → ("588(男)", "36108(男)").
     Assumption: Gaokao scores are typically 3 digits (200..750), rank is remaining digits.
     """
-    normalized = normalize_cell_text(value).translate(AMBIGUOUS_DIGIT_MAP)
-    if not normalized or not re.fullmatch(r"\d{5,}", normalized):
+    normalized = normalize_cell_text(value)
+    if not normalized:
         return None
 
-    score_part = normalized[:3]
-    rank_part = normalized[3:]
+    # Try annotated packed value first: "588(男)36108(男)"
+    # Each segment is a number optionally followed by parenthesized annotation
+    segments = re.findall(r"\d+[（(][^）)]*[）)]|\d+", normalized)
+    if len(segments) == 2:
+        first_num = re.match(r"(\d+)", segments[0])
+        if first_num:
+            try:
+                score = int(first_num.group(1))
+                if 200 <= score <= 750:
+                    return segments[0], segments[1]
+            except ValueError:
+                pass
+
+    # Pure digit packed value: "55469531"
+    digits_only = normalized.translate(AMBIGUOUS_DIGIT_MAP)
+    digits_only = re.sub(r"[^0-9]", "", digits_only)
+    if not digits_only or not re.fullmatch(r"\d{5,}", digits_only):
+        return None
+
+    score_part = digits_only[:3]
+    rank_part = digits_only[3:]
     try:
         score = int(score_part)
         if 200 <= score <= 750 and int(rank_part) >= 0:
@@ -402,6 +431,51 @@ def repair_table_structure(table: List[List[str]]) -> Dict[str, Any]:
                 continue
 
             current_value = row[column]
+
+            # Detect multi-token BEFORE normalizing — normalization may
+            # drop tokens separated by "/" (e.g. "554/69531" → "554").
+            tokens = extract_numeric_tokens(current_value)
+
+            if len(tokens) > 1:
+                # Split by separator and keep original segments (preserving
+                # text annotations like "567（男）" that extract_numeric_tokens
+                # would strip to bare "567").
+                raw_segments = [
+                    s for s in re.split(r"[\s\n/]+", normalize_cell_text(current_value)) if s
+                ]
+
+                # Multi-token: try to distribute across columns first
+                target_columns = [column]
+                for later_column in range(column + 1, len(row)):
+                    if normalize_cell_text(row[later_column]):
+                        if len(target_columns) > 1:
+                            break
+                        continue
+                    if later_column in numeric_columns or later_column == column + len(target_columns):
+                        target_columns.append(later_column)
+                    if len(target_columns) == len(tokens):
+                        break
+
+                if len(target_columns) == len(tokens) and len(target_columns) > 1:
+                    # Prefer raw segments when they align with numeric tokens
+                    # so that text like "（男）" is preserved.
+                    values = raw_segments if len(raw_segments) == len(tokens) else tokens
+                    for target_index, val in zip(target_columns, values):
+                        row[target_index] = val
+                    corrections.append(
+                        {
+                            "original": current_value,
+                            "corrected": " | ".join(values),
+                            "reason": (
+                                f"split packed numeric values across columns "
+                                f"{', '.join(str(item + 1) for item in target_columns)}"
+                            ),
+                        }
+                    )
+                    continue
+                # Cannot distribute — fall through to normalize as single cell
+
+            # Single token (or undistributable multi-token): safe to normalize
             normalized_value = normalize_numeric_text(current_value)
             if current_value and normalized_value != current_value:
                 row[column] = normalized_value
@@ -410,36 +484,6 @@ def repair_table_structure(table: List[List[str]]) -> Dict[str, Any]:
                         "original": current_value,
                         "corrected": normalized_value,
                         "reason": f"normalized numeric cell at row {row_index + 1}, column {column + 1}",
-                    }
-                )
-
-            tokens = extract_numeric_tokens(row[column])
-            if len(tokens) <= 1:
-                continue
-
-            target_columns = [column]
-            for later_column in range(column + 1, len(row)):
-                if normalize_cell_text(row[later_column]):
-                    if len(target_columns) > 1:
-                        break
-                    continue
-                if later_column in numeric_columns or later_column == column + len(target_columns):
-                    target_columns.append(later_column)
-                if len(target_columns) == len(tokens):
-                    break
-
-            if len(target_columns) == len(tokens) and len(target_columns) > 1:
-                original_value = row[column]
-                for target_index, token in zip(target_columns, tokens):
-                    row[target_index] = token
-                corrections.append(
-                    {
-                        "original": original_value,
-                        "corrected": " | ".join(tokens),
-                        "reason": (
-                            f"split packed numeric values across columns "
-                            f"{', '.join(str(item + 1) for item in target_columns)}"
-                        ),
                     }
                 )
 
