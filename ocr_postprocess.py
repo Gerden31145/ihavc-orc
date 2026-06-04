@@ -524,7 +524,7 @@ def repair_table_structure(table: List[List[str]]) -> Dict[str, Any]:
                     # Also remove preceding sparse row (outer frame label)
                     if row_idx > 1:
                         prev = repaired[row_idx - 1]
-                        if _count_filled(prev) <= max(len(prev), 1) // 2:
+                        if _count_filled(prev) < max(len(prev), 1) // 2:
                             rows_to_remove.append(row_idx - 1)
                     rows_to_remove.append(row_idx)
 

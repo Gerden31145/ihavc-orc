@@ -126,21 +126,86 @@ def parse_table_text_to_matrix(text):
 
     # 尝试 HTML 表格解析
     if "<table" in text.lower():
-        return _parse_html_table(text)
+        matrix = _parse_html_table(text)
+        if matrix:
+            # GLM-OCR 有时在 </table> 之后仍然输出纯文本格式的表格行，
+            # 尝试解析这些附加行并拼接到主矩阵。
+            remainder = _extract_post_table_text(text)
+            if remainder and remainder.strip():
+                extra_rows = _parse_plain_text_rows(remainder, len(matrix[0]) if matrix else 0)
+                if extra_rows:
+                    matrix.extend(extra_rows)
+        return matrix
 
     # fallback: Markdown 解析
     return _parse_markdown_table(text)
 
 
+def _extract_post_table_text(html_text: str) -> str:
+    """提取 </table> 之后的文本内容。"""
+    close_idx = html_text.lower().rfind("</table>")
+    if close_idx < 0:
+        return ""
+    return html_text[close_idx + len("</table>"):]
+
+
+def _parse_plain_text_rows(text: str, col_count: int) -> list:
+    """
+    将纯文本解析为表格行。处理 GLM-OCR 在 </table> 之后输出的行。
+    策略：跳过看起来像表头/噪声的行，将每行拆分为单元格。
+    """
+    if col_count <= 0 or not text.strip():
+        return []
+
+    lines = text.strip().split("\n")
+    rows = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        # 跳过看起来像表头重复的行（包含已知列名）
+        if "编号" in line and "招生院校" in line:
+            continue
+        # 尝试按空格拆分，但保留括号/方括号内的空格
+        cells = _smart_split_line(line, col_count)
+        if cells and len(cells) >= 2:
+            # 补齐列数
+            while len(cells) < col_count:
+                cells.append("")
+            rows.append(cells[:col_count])
+
+    return rows
+
+
+def _smart_split_line(line: str, col_count: int) -> list:
+    """
+    智能拆分纯文本行为单元格。
+    策略：第一列通常是短编号(如 '22', '1B')，后面是描述文本。
+    """
+    # 尝试找到第一个 token（编号/代码）
+    # 编号通常是 2-4 位的字母数字组合
+    m = re.match(r'^([A-Za-z0-9]{1,4})\s+(.+)$', line)
+    if m:
+        return [m.group(1), m.group(2)]
+    # 如果没有明确的编号前缀，整行作为一列
+    return [line]
+
+
 def _parse_html_table(html_text):
-    """解析 HTML <table> 为矩阵。"""
+    """解析 HTML <table> 为矩阵。支持 colspan 属性。"""
     rows = []
     for tr_match in re.finditer(r"<tr[^>]*>(.*?)</tr>", html_text, re.IGNORECASE | re.DOTALL):
         tr_content = tr_match.group(1)
         cells = []
         for td_match in re.finditer(r"<t[dh][^>]*>(.*?)</t[dh]>", tr_content, re.IGNORECASE | re.DOTALL):
             cell_text = re.sub(r"<[^>]+>", "", td_match.group(1)).strip()
+            # Handle colspan: detect colspan="N" and insert the cell text + (N-1) empty cells
+            tag_attrs = td_match.group(0)[:td_match.group(0).index(">") + 1]
+            colspan_m = re.search(r'colspan\s*=\s*["\']?(\d+)', tag_attrs, re.IGNORECASE)
+            colspan = int(colspan_m.group(1)) if colspan_m else 1
             cells.append(cell_text)
+            for _ in range(colspan - 1):
+                cells.append("")
         if cells:
             rows.append(cells)
 
@@ -201,16 +266,35 @@ async def run_table_recognition_pipeline(image_data):
     2. 表格结构修复（投档线/排位拆分等）
     """
     ocr_text = await call_glm_ocr(image_data)
+    # Debug: save raw OCR text
+    if ocr_text:
+        logger.info(f"[DEBUG] raw OCR text length: {len(ocr_text)}")
+        logger.info(f"[DEBUG] raw OCR text (first 2000 chars): {ocr_text[:2000]}")
+        # Check for 园林 in raw text
+        if '园林' in ocr_text:
+            idx = ocr_text.index('园林')
+            logger.info(f"[DEBUG] 园林 in raw OCR at pos {idx}: ...{ocr_text[max(0,idx-50):idx+200]}...")
     matrix = parse_table_text_to_matrix(ocr_text) if ocr_text else None
 
     # 表格结构修复：拆分粘连表头、粘连数字等
     repair_corrections = []
     if matrix:
+        logger.info(f"[DEBUG] repair 前 headers: {matrix[0] if matrix else 'N/A'}")
+        for i, row in enumerate(matrix[:4]):
+            logger.info(f"[DEBUG] repair 前 row[{i}]: {row}")
         repair_result = repair_table_structure(matrix)
         matrix = repair_result["table"]
         repair_corrections = repair_result.get("corrections", [])
         if repair_corrections:
             logger.info(f"表格结构修复: {len(repair_corrections)} 项修正")
+            for c in repair_corrections:
+                logger.info(f"[DEBUG] correction: {c}")
+        else:
+            logger.info(f"[DEBUG] repair 未产生任何修正, numeric_columns={repair_result.get('numeric_columns', [])}")
+        logger.info(f"[DEBUG] repair 后 total rows: {len(matrix)}")
+        logger.info(f"[DEBUG] repair 后 headers: {matrix[0] if matrix else 'N/A'}")
+        for i, row in enumerate(matrix[:4]):
+            logger.info(f"[DEBUG] repair 后 row[{i}]: {row}")
 
     meta = {
         "source_engine": "glm-ocr",
@@ -394,10 +478,37 @@ async def ocr_batch(files: List[UploadFile] = File(...), enhance: bool = True):
                 all_repair_corrections.extend(page_meta["repair_corrections"])
 
         # 合并跨页表格
+        # Debug: log each page matrix
+        for pi, pm in enumerate(page_matrices):
+            if pm:
+                logger.info(f"[DEBUG] page {pi+1}: {len(pm)} rows, {len(pm[0]) if pm else 0} cols, header={pm[0] if pm else 'N/A'}")
+            else:
+                logger.info(f"[DEBUG] page {pi+1}: None")
         merged = merge_cross_page_tables(page_matrices)
         headers = merged["headers"]
         rows = merged["rows"]
         diagnostics = merged["merge_diagnostics"]
+        logger.info(f"[DEBUG] merged: headers={headers}, total_rows={len(rows)}, diagnostics={diagnostics}")
+        if rows:
+            for i in range(min(3, len(rows))):
+                logger.info(f"[DEBUG] merged row[{i}]: {rows[i]}")
+            logger.info(f"[DEBUG] merged row[-1]: {rows[-1]}")
+            # Log the last 5 rows of page 1 (before page 2 data starts)
+            page1_data_count = sum(1 for r in page_matrices[0][1:] if r is not None) if page_matrices[0] else 0
+            logger.info(f"[DEBUG] page1 data rows count: {page1_data_count}")
+            # Find "园林" rows
+            for i, row in enumerate(rows):
+                if any('园林' in str(cell) for cell in row):
+                    logger.info(f"[DEBUG] 园林 row at merged[{i}]: {row}")
+            # Find row that contains "常者不宜"
+            for i, row in enumerate(rows):
+                if any('常者不宜' in str(cell) for cell in row):
+                    logger.info(f"[DEBUG] 常者不宜 row at merged[{i}]: {row}")
+            # Log last 3 rows of what would be page1 boundary
+            if len(rows) > page1_data_count:
+                boundary = page1_data_count
+                for i in range(max(0, boundary-2), min(len(rows), boundary+3)):
+                    logger.info(f"[DEBUG] boundary row[{i}]: {rows[i]}")
 
         if not headers:
             return {"success": False, "error": "未能提取到有效表格内容"}

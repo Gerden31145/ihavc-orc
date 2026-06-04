@@ -22,6 +22,12 @@ def _clean_cell(cell: str) -> str:
     return cell
 
 
+def _is_sparse_data_row(row: List[str], max_filled: int = 2) -> bool:
+    """Return True if *row* has ≤ *max_filled* non-empty cells (likely overflow text)."""
+    filled = sum(1 for cell in row if cell.strip())
+    return 0 < filled <= max_filled
+
+
 def _is_header_row(row: List[str], reference: List[str], threshold: float = 0.7) -> bool:
     """判断一行是否为表头行（与 clean 后的 reference 模糊匹配）。"""
     if len(row) != len(reference):
@@ -107,9 +113,10 @@ def merge_cross_page_tables(
 
     # 2. 遍历所有页所有行
     header_count = 0
-    for matrix in page_matrices:
+    for page_idx, matrix in enumerate(page_matrices):
         if matrix is None or not matrix:
             continue
+        is_first_data_of_page = True
         for row in matrix:
             # 统一列数
             norm = list(row[:col_count])
@@ -129,8 +136,30 @@ def merge_cross_page_tables(
                     all_rows[-1] = prev
                     logger.info(f"表头行溢出: {overflow_parts} → 合并到上一行")
                 # 跳过表头行本身
+                is_first_data_of_page = True
+            elif (
+                page_idx > 0
+                and _is_sparse_data_row(norm)
+                and all_rows
+            ):
+                # 跨页数据行溢出：稀疏行（只有1-2个单元格有文本），
+                # 说明是上一行文本的续行（跨行溢出），拼接到上一行。
+                # 不仅限于页首行，页中间的稀疏行也可能是 OCR 拆分导致的溢出。
+                overflow_text = "".join(c for c in norm if c.strip())
+                prev = list(all_rows[-1])
+                # 找上一行中最长的非空单元格作为拼接目标
+                target_j = max(
+                    ((j, len(prev[j].strip())) for j in range(len(prev)) if prev[j].strip()),
+                    key=lambda x: x[1],
+                    default=(1, 0),
+                )[0]
+                prev[target_j] = prev[target_j] + overflow_text
+                all_rows[-1] = prev
+                logger.info(f"跨页数据行溢出: '{overflow_text}' → 合并到上一行列{target_j}")
+                is_first_data_of_page = False
             else:
                 all_rows.append(norm)
+                is_first_data_of_page = False
 
     logger.info(f"共过滤 {header_count} 个表头行, 保留 {len(all_rows)} 个数据行")
 
