@@ -25,7 +25,7 @@
             <line x1="12" y1="3" x2="12" y2="15" stroke-width="2"/>
           </svg>
           <p class="upload-text">点击或拖拽图片到此处</p>
-          <p class="upload-hint">支持 JPG、PNG 格式，最多10张图片</p>
+          <p class="upload-hint">支持 JPG、PNG 格式</p>
         </div>
 
         <div v-else class="preview-grid">
@@ -39,7 +39,7 @@
             <div v-else-if="processingStatus[index] === 'error'" class="thumb-overlay error">&#10007;</div>
             <button @click.stop="removeImage(index)" class="remove-btn">×</button>
           </div>
-          <div v-if="previewImages.length < MAX_FILES" class="preview-item add-more" @click.stop="triggerFileInput">
+          <div class="preview-item add-more" @click.stop="triggerFileInput">
             <span>+</span>
           </div>
         </div>
@@ -222,7 +222,6 @@ const fileInput = ref<HTMLInputElement>()
 const useLLMEnhancement = ref(false)
 const crossPageMode = ref(false)
 
-const MAX_FILES = 10
 const selectedFiles = ref<File[]>([])
 const previewImages = ref<string[]>([])
 const processingStatus = ref<('pending' | 'processing' | 'done' | 'error')[]>([])
@@ -266,7 +265,7 @@ const handleFileSelect = (event: Event) => {
   const target = event.target as HTMLInputElement
   const files = target.files
   if (!files) return
-  const fileArray = Array.from(files).slice(0, MAX_FILES)
+  const fileArray = Array.from(files)
   processFiles(fileArray)
 }
 
@@ -275,7 +274,7 @@ const handleDrop = (event: DragEvent) => {
   isDragOver.value = false
   const files = event.dataTransfer?.files
   if (!files) return
-  const imageFiles = Array.from(files).filter(f => f.type.startsWith('image/')).slice(0, MAX_FILES)
+  const imageFiles = Array.from(files).filter(f => f.type.startsWith('image/'))
   if (imageFiles.length === 0) {
     errorMessage.value = '请上传图片文件'
     return
