@@ -365,6 +365,21 @@ const startOcr = async () => {
   }
 }
 
+// 并发限制工具函数
+const CONCURRENCY_LIMIT = 5
+async function limitConcurrency<T>(tasks: (() => Promise<T>)[], limit: number): Promise<T[]> {
+  const results: T[] = new Array(tasks.length)
+  let nextIndex = 0
+  const runNext = async (): Promise<void> => {
+    while (nextIndex < tasks.length) {
+      const idx = nextIndex++
+      results[idx] = await tasks[idx]()
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, () => runNext()))
+  return results
+}
+
 // 并行识别（原有逻辑）
 const startParallelOcr = async () => {
   const allRows: string[][] = []
@@ -372,25 +387,28 @@ const startParallelOcr = async () => {
   const failedIndices: number[] = []
 
   processingStatus.value = selectedFiles.value.map(() => 'processing')
-  const tasks = selectedFiles.value.map((file, i) => {
+  const tasks = selectedFiles.value.map((file, i) => async () => {
     const formData = new FormData()
     formData.append('file', file)
     const baseUrl = import.meta.env.VITE_API_BASE_URL || ''
     const url = `${baseUrl}/api/ocr?enhance=${useLLMEnhancement.value}`
-    return fetch(url, { method: 'POST', body: formData })
-      .then(res => res.json())
-      .then(result => ({ index: i, result, fileName: file.name }))
-      .catch(error => {
-        console.error(`第 ${i + 1} 张图片 OCR 请求失败:`, error)
-        return ({ index: i, result: null, fileName: file.name })
-      })
+    try {
+      const res = await fetch(url, { method: 'POST', body: formData })
+      if (!res.ok) {
+        console.error(`第 ${i + 1} 张图片 OCR 请求失败: HTTP ${res.status}`)
+        return { index: i, result: null, fileName: file.name }
+      }
+      const result = await res.json()
+      return { index: i, result, fileName: file.name }
+    } catch (error) {
+      console.error(`第 ${i + 1} 张图片 OCR 请求失败:`, error)
+      return { index: i, result: null, fileName: file.name }
+    }
   })
 
-  const settled = await Promise.allSettled(tasks)
+  const settled = await limitConcurrency(tasks, CONCURRENCY_LIMIT)
 
-  for (const entry of settled) {
-    if (entry.status === 'rejected') continue
-    const { index: i, result, fileName } = entry.value
+  for (const { index: i, result, fileName } of settled) {
 
     if (result && result.success) {
       let headers: string[]
@@ -466,6 +484,9 @@ const startCrossPageOcr = async () => {
 
   try {
     const response = await fetch(url, { method: 'POST', body: formData })
+    if (!response.ok) {
+      throw new Error(`服务器返回错误: HTTP ${response.status}`)
+    }
     const result = await response.json()
 
     if (result.success) {
