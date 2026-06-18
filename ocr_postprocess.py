@@ -1,3 +1,4 @@
+import difflib
 import io
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -255,6 +256,107 @@ def _is_rank_header(text: str) -> bool:
 def _count_filled(row: Sequence[str]) -> int:
     """Count non-empty cells in a row."""
     return sum(1 for cell in row if normalize_cell_text(cell))
+
+
+def _norm_cell_key(cell: Any) -> str:
+    """Collapse whitespace for header-cell comparison (case/space-insensitive)."""
+    return re.sub(r"\s+", "", normalize_cell_text(cell))
+
+
+def _detect_repeated_header_blocks(row: Sequence[str], min_block: int = 2) -> Tuple[int, List[str]]:
+    """
+    If *row* is K>=2 repetitions of an n-col block (n >= min_block), return
+    (K, first_block). Otherwise return (1, list(row)).
+
+    Used to detect GLM-OCR gluing two side-by-side same-header tables into one
+    wide matrix (header = the n-col header repeated K times).
+    """
+    cells = [normalize_cell_text(c) for c in row]
+    total = len(cells)
+    if total < min_block * 2:
+        return 1, list(cells)
+    # Prefer fewer, wider blocks: try K = 2, 3, ... (narrowing n).
+    for k in range(2, total // min_block + 1):
+        if total % k != 0:
+            continue
+        n = total // k
+        if n < min_block:
+            break
+        blocks = [cells[i * n:(i + 1) * n] for i in range(k)]
+        first_keys = [_norm_cell_key(c) for c in blocks[0]]
+        # All blocks must match the first (exact, after normalization — the
+        # duplicated header is byte-identical in the OCR output).
+        if all(
+            first_keys == [_norm_cell_key(c) for c in block]
+            for block in blocks[1:]
+        ):
+            return k, list(blocks[0])
+    return 1, list(cells)
+
+
+def _chunk_is_real(chunk: Sequence[str]) -> bool:
+    """
+    Decide whether a split-out column chunk represents a real data row vs. an
+    OCR line-bleed fragment (e.g. '学)' or '电子信息科学与技术、通信工程)' leaking
+    into the adjacent table's column when a long cell wrapped).
+
+    Real entries always carry at least a 编号 plus one more field (or a name plus
+    a number), i.e. >= 2 filled cells. Anything with <= 1 filled cell is a
+    fragment/bleed and is dropped to avoid corrupting adjacent rows downstream.
+    """
+    return sum(1 for c in chunk if normalize_cell_text(c)) >= 2
+
+
+def split_parallel_tables(
+    table: List[List[str]],
+) -> Tuple[List[List[str]], List[Dict[str, str]]]:
+    """
+    Detect side-by-side same-header tables glued into one wide matrix by GLM-OCR
+    and split them column-major (read the whole left table top-to-bottom, then
+    the right table) into a single n-column table.
+
+    Returns (new_table, corrections). If the input is not a parallel layout it is
+    returned unchanged with no corrections.
+    """
+    if not table:
+        return table, []
+
+    # Locate the row carrying a repeated-header block (usually row 0; tolerate a
+    # leading sparse frame row).
+    header_idx: Optional[int] = None
+    k, block = 1, []
+    for hi, row in enumerate(table):
+        kk, blk = _detect_repeated_header_blocks(row)
+        if kk >= 2:
+            header_idx, k, block = hi, kk, list(blk)
+            break
+
+    if header_idx is None:
+        return table, []
+
+    n = len(block)
+    body = table[header_idx + 1:]
+    new_rows: List[List[str]] = [list(block)]
+    dropped = 0
+    for col in range(k):
+        for row in body:
+            chunk = list(row[col * n:(col + 1) * n])
+            while len(chunk) < n:
+                chunk.append("")
+            if not _chunk_is_real(chunk):
+                if any(normalize_cell_text(c) for c in chunk):
+                    dropped += 1
+                continue
+            new_rows.append(chunk)
+
+    corrections: List[Dict[str, str]] = [{
+        "original": f"{len(table)} rows x {len(table[0]) if table else 0} cols "
+                    f"(K={k} side-by-side same-header tables)",
+        "corrected": f"split column-major into {n}-col table, "
+                     f"{len(new_rows) - 1} data rows ({dropped} fragment rows dropped)",
+        "reason": "split side-by-side same-header tables into stacked rows",
+    }]
+    return new_rows, corrections
 
 
 def _flatten_multirow_headers(table: List[List[str]], corrections: List[Dict[str, str]]) -> List[List[str]]:

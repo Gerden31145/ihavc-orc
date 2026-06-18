@@ -12,7 +12,7 @@ import logging
 from llm_enhancer import LLMEnhancer
 from table_splitter import split_table_by_repeated_headers, merge_split_results
 from cross_page_merger import merge_cross_page_tables
-from ocr_postprocess import repair_table_structure
+from ocr_postprocess import repair_table_structure, split_parallel_tables
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -279,15 +279,23 @@ async def run_table_recognition_pipeline(image_data):
     # 表格结构修复：拆分粘连表头、粘连数字等
     repair_corrections = []
     if matrix:
+        # 并排同表头表格拆分：GLM 偶尔会把一张图上并排的两张同表头表格粘成
+        # 一张宽表（表头 = n 列重复 K 次）。按列优先（读完左列再读右列）
+        # 拆成一张干净的 n 列表，丢弃换行串位产生的碎片行。
+        matrix, split_corrections = split_parallel_tables(matrix)
+        repair_corrections.extend(split_corrections)
+        if split_corrections:
+            logger.info(f"[DEBUG] 并排表格拆分: {split_corrections[0]['corrected']}")
+
         logger.info(f"[DEBUG] repair 前 headers: {matrix[0] if matrix else 'N/A'}")
         for i, row in enumerate(matrix[:4]):
             logger.info(f"[DEBUG] repair 前 row[{i}]: {row}")
         repair_result = repair_table_structure(matrix)
         matrix = repair_result["table"]
-        repair_corrections = repair_result.get("corrections", [])
-        if repair_corrections:
-            logger.info(f"表格结构修复: {len(repair_corrections)} 项修正")
-            for c in repair_corrections:
+        repair_corrections.extend(repair_result.get("corrections", []))
+        if repair_result.get("corrections"):
+            logger.info(f"表格结构修复: {len(repair_result['corrections'])} 项修正")
+            for c in repair_result["corrections"]:
                 logger.info(f"[DEBUG] correction: {c}")
         else:
             logger.info(f"[DEBUG] repair 未产生任何修正, numeric_columns={repair_result.get('numeric_columns', [])}")
