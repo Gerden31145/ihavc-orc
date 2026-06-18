@@ -465,17 +465,32 @@ async def ocr_batch(files: List[UploadFile] = File(...), enhance: bool = True):
             raise HTTPException(status_code=400, detail=f"读取图片失败: {str(e)}")
 
     try:
-        # 按顺序逐张识别
-        page_matrices: List[list | None] = []
-        all_repair_corrections = []
-        for idx, img_data in enumerate(images):
-            if idx > 0:
-                await asyncio.sleep(0.5)
-            logger.info(f"批量OCR: 正在处理第{idx+1}/{len(images)}张图片")
-            matrix, page_meta = await run_table_recognition_pipeline(img_data)
-            page_matrices.append(matrix)
-            if page_meta.get("repair_corrections"):
-                all_repair_corrections.extend(page_meta["repair_corrections"])
+        # 并发识别所有图片（保留原始顺序，限流避免 GLM 服务端排队）
+        # 实测：并发 5 为最优——超过后单图延迟从 ~29s 飙升到 47-64s，总耗时反而更长
+        OCR_CONCURRENCY = 5
+        page_matrices: List[list | None] = [None] * len(images)
+        all_repair_corrections: list = []
+        semaphore = asyncio.Semaphore(OCR_CONCURRENCY)
+        progress_lock = asyncio.Lock()
+        done_count = 0
+
+        async def process_one(idx: int, img_data: bytes):
+            nonlocal done_count
+            async with semaphore:
+                logger.info(f"批量OCR: 正在处理第{idx+1}/{len(images)}张图片")
+                matrix, page_meta = await run_table_recognition_pipeline(img_data)
+                page_matrices[idx] = matrix
+                async with progress_lock:
+                    done_count += 1
+                    logger.info(f"批量OCR: 已完成 {done_count}/{len(images)}")
+                return page_meta.get("repair_corrections", [])
+
+        corrections_per_page = await asyncio.gather(
+            *[process_one(i, img) for i, img in enumerate(images)]
+        )
+        for corrections in corrections_per_page:
+            if corrections:
+                all_repair_corrections.extend(corrections)
 
         # 合并跨页表格
         # Debug: log each page matrix
