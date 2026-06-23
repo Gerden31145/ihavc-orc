@@ -1,5 +1,6 @@
-from typing import List
+from typing import List, Optional
 from fastapi import FastAPI, File, UploadFile, HTTPException
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import base64
 import io
@@ -44,7 +45,10 @@ llm_enhancer = LLMEnhancer(api_key=DEEPSEEK_API_KEY)
 
 async def call_glm_ocr(image_data):
     """调用智谱 GLM-OCR 同步文档解析，返回识别文本。遇到 429 自动重试。"""
-    max_retries = 3
+    # 429 限流窗口有时持续十几秒, 多试几次 + 递增退避能显著降低失败率。
+    # 只影响被限流的图(200 直接返回不重试), 不改变任何识别结果。
+    max_retries = 5
+    backoff_seconds = [4, 8, 14, 22]
     try:
         img_fmt = _detect_image_format(image_data)
         b64 = base64.b64encode(image_data).decode("utf-8")
@@ -67,8 +71,8 @@ async def call_glm_ocr(image_data):
                     break
 
                 if resp.status_code == 429 and attempt < max_retries - 1:
-                    wait = 3 * (attempt + 1)
-                    logger.warning(f"GLM-OCR 限流(429), 第{attempt+1}次重试, 等待{wait}秒...")
+                    wait = backoff_seconds[attempt]
+                    logger.warning(f"GLM-OCR 限流(429), 第{attempt+1}/{max_retries}次重试, 等待{wait}秒...")
                     await asyncio.sleep(wait)
                     continue
 
@@ -655,6 +659,51 @@ async def ocr_batch(files: List[UploadFile] = File(...), enhance: bool = True):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"批量OCR服务调用失败: {str(e)}")
+
+
+class MergeRequest(BaseModel):
+    # 每页完整矩阵 [headers, ...rows];某页识别失败时该位置传 null,
+    # merge_cross_page_tables 会跳过并计入 pages_failed
+    pages: List[Optional[List[List[str]]]]
+
+
+@app.post("/api/merge")
+async def merge_tables(req: MergeRequest):
+    """
+    跨页表格合并(配合前端分片上传):接收逐张识别得到的每页矩阵,
+    调用 merge_cross_page_tables 合并为一张完整表格。
+    识别仍由 /api/ocr 逐张完成,本接口只做合并,不调用 OCR。
+    """
+    if not req.pages:
+        return {"success": False, "error": "未提供任何页面数据"}
+
+    pages = req.pages
+    try:
+        merged = merge_cross_page_tables(pages)
+        headers = merged["headers"]
+        rows = merged["rows"]
+        diagnostics = merged["merge_diagnostics"]
+
+        if not headers:
+            return {
+                "success": False,
+                "error": "所有页面识别均失败或无有效表格内容",
+                "data": {"meta": {"source_engine": "glm-ocr", "merge_diagnostics": diagnostics}},
+            }
+
+        # 返回结构与 /api/ocr-batch (enhance=false) 对齐, 便于前端复用渲染逻辑
+        return {
+            "success": True,
+            "data": {
+                "headers": headers,
+                "rows": rows,
+                "meta": {"source_engine": "glm-ocr", "merge_diagnostics": diagnostics},
+            },
+            "enhancement": {"applied": False},
+        }
+    except Exception as e:
+        logger.exception("合并接口异常")
+        raise HTTPException(status_code=500, detail=f"合并服务调用失败: {str(e)}")
 
 
 @app.post("/api/synthesize")

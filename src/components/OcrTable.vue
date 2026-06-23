@@ -46,9 +46,13 @@
         </div>
 
         <div v-if="isLoading" class="progress-bar-container">
-          <template v-if="selectedFiles.length > 1">
+          <template v-if="isMerging">
             <div class="progress-bar indeterminate"></div>
-            <span class="progress-text">正在跨页识别合并...</span>
+            <span class="progress-text">正在合并 {{ selectedFiles.length }} 页...</span>
+          </template>
+          <template v-else-if="selectedFiles.length > 1">
+            <div class="progress-bar" :style="{ width: progressPercent + '%' }"></div>
+            <span class="progress-text">正在识别 {{ doneCount }} / {{ selectedFiles.length }}...</span>
           </template>
           <template v-else>
             <div class="progress-bar" :style="{ width: progressPercent + '%' }"></div>
@@ -56,7 +60,7 @@
           </template>
         </div>
 
-        <div v-if="isLoading" class="loading-overlay">
+        <div v-if="isLoading && !isMerging" class="loading-overlay">
           <div class="spinner"></div>
           <p>正在识别...</p>
         </div>
@@ -204,6 +208,7 @@ interface SplitTable {
 
 const isDragOver = ref(false)
 const isLoading = ref(false)
+const isMerging = ref(false)
 const errorMessage = ref('')
 const fileInput = ref<HTMLInputElement>()
 
@@ -310,6 +315,9 @@ const progressPercent = computed(() => {
   return selectedFiles.value.length > 0 ? (done / selectedFiles.value.length) * 100 : 0
 })
 
+// 已完成(成功+失败)的张数, 用于跨页识别阶段的进度文案
+const doneCount = computed(() => processingStatus.value.filter(s => s === 'done' || s === 'error').length)
+
 // 开始OCR识别
 const startOcr = async () => {
   if (selectedFiles.value.length === 0) {
@@ -338,7 +346,10 @@ const startOcr = async () => {
 }
 
 // 并发限制工具函数
-const CONCURRENCY_LIMIT = 5
+// GLM 单 key 瞬时并发上限≈2(实测: 8 并发→2×200+6×1302 "并发限制")。
+// 设 3 略超上限, 偶发 429 由 call_glm_ocr 退避救回; 远好于 5(必撞 3 个 429 白等重试)。
+// 有效并发都是 2, 故 3 不比 5 慢, 且近乎零失败。
+const CONCURRENCY_LIMIT = 3
 async function limitConcurrency<T>(tasks: (() => Promise<T>)[], limit: number): Promise<T[]> {
   const results: T[] = new Array(tasks.length)
   let nextIndex = 0
@@ -442,54 +453,117 @@ const startParallelOcr = async () => {
   }
 }
 
-// 跨页合并识别
+// 跨页合并识别（分片上传：逐张调 /api/ocr 识别 + 一次 /api/merge 合并，
+// 单请求只传 1 张图，规避一次性多图请求体过大被 nginx 413 拦截）
 const startCrossPageOcr = async () => {
-  processingStatus.value = selectedFiles.value.map(() => 'processing')
-
-  const formData = new FormData()
-  selectedFiles.value.forEach(file => {
-    formData.append('files', file)
-  })
-
+  const files = selectedFiles.value
+  processingStatus.value = files.map(() => 'processing')
+  isMerging.value = false
   const baseUrl = import.meta.env.VITE_API_BASE_URL || ''
-  const url = `${baseUrl}/api/ocr-batch?enhance=false`
 
-  try {
-    const response = await fetch(url, { method: 'POST', body: formData })
-    if (!response.ok) {
-      throw new Error(`服务器返回错误: HTTP ${response.status}`)
+  // 每页完整矩阵 [headers, ...rows]；失败页保持 null
+  const pages: (string[][] | null)[] = new Array(files.length).fill(null)
+  const failedIndices: number[] = []
+
+  // 单图识别: 成功则填 pages[i] 并返回 true, 失败返回 false(状态由调用方设置)
+  const recognizeOne = async (i: number, file: File): Promise<boolean> => {
+    const formData = new FormData()
+    formData.append('file', file)
+    const url = `${baseUrl}/api/ocr?enhance=false`
+    try {
+      const res = await fetch(url, { method: 'POST', body: formData })
+      if (!res.ok) {
+        console.error(`第 ${i + 1} 张图片 OCR 请求失败: HTTP ${res.status}`)
+        return false
+      }
+      const result = await res.json()
+      if (result.success && result.data && (result.data.headers || []).length > 0) {
+        // 拼回完整矩阵: merge_cross_page_tables 需要表头作为全局 reference
+        pages[i] = [result.data.headers, ...(result.data.rows || [])]
+        return true
+      }
+      return false
+    } catch (error) {
+      console.error(`第 ${i + 1} 张图片 OCR 请求失败:`, error)
+      return false
     }
-    const result = await response.json()
+  }
+
+  // 汇总当前仍失败(pages[i]===null)的页 -> failedIndices / failedImageNames
+  const collectFailed = () => {
+    failedIndices.length = 0
+    failedImageNames.value = []
+    files.forEach((file, i) => {
+      if (pages[i] === null) {
+        failedIndices.push(i)
+        failedImageNames.value.push(file.name)
+      }
+    })
+  }
+
+  // 1. 第一轮: 并发识别(限 CONCURRENCY_LIMIT)。GLM 单 key 瞬时并发上限≈2,
+  //    并发 3 会有偶发 429, 由后端 call_glm_ocr 退避救回, 极端连续 429 才失败。
+  const firstTasks = files.map((file, i) => async () => {
+    const ok = await recognizeOne(i, file)
+    processingStatus.value[i] = ok ? 'done' : 'error'
+  })
+  await limitConcurrency(firstTasks, CONCURRENCY_LIMIT)
+
+  // 第一轮后汇总失败页(供全失败判断与错误提示)
+  collectFailed()
+
+  // 全部失败则提前退出，不发合并请求
+  if (pages.every(p => p === null)) {
+    errorMessage.value = `所有图片均识别失败（${failedImageNames.value.join('、')}），请检查图片是否清晰`
+    currentProcessingIndex.value = -1
+    isLoading.value = false
+    return
+  }
+
+  // 兜底: 对第一轮失败的几张补跑一轮。此时其余页已完成、GLM 配额已恢复，
+  // 用低并发(2)重试几乎不会再撞 429，能把极端连续失败的图救回。
+  if (failedIndices.length > 0) {
+    const retryTasks = failedIndices.map((i) => async () => {
+      processingStatus.value[i] = 'processing' // 显示"重试中"
+      const ok = await recognizeOne(i, files[i])
+      processingStatus.value[i] = ok ? 'done' : 'error'
+    })
+    await limitConcurrency(retryTasks, 2)
+    collectFailed() // 补跑后重新汇总最终失败
+  }
+
+  // 2. 合并阶段
+  isMerging.value = true
+  try {
+    const mergeRes = await fetch(`${baseUrl}/api/merge`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pages }),
+    })
+    if (!mergeRes.ok) {
+      throw new Error(`服务器返回错误: HTTP ${mergeRes.status}`)
+    }
+    const result = await mergeRes.json()
 
     if (result.success) {
-      processingStatus.value = processingStatus.value.map(() => 'done')
+      tableData.headers = result.data.headers || []
+      tableData.rows = result.data.rows || []
 
-      if (result.data.tables && result.data.tables.length > 0) {
-        splitTables.value = result.data.tables
-        isSplit.value = true
-      } else {
-        tableData.headers = result.data.headers || []
-        tableData.rows = result.data.rows || []
+      const warnings = result.data.meta?.merge_diagnostics?.warnings || []
+      if (warnings.length > 0) {
+        errorMessage.value = warnings.join('; ')
       }
-
-      if (result.enhancement) {
-        enhancementInfo.applied = result.enhancement.applied
-        enhancementInfo.corrections = result.enhancement.corrections || []
-        enhancementInfo.tableStructure = result.enhancement.table_structure || {}
-        enhancementInfo.error = result.enhancement.error || ''
-      }
-
-      if (result.data.meta?.merge_diagnostics?.warnings?.length > 0) {
-        errorMessage.value = result.data.meta.merge_diagnostics.warnings.join('; ')
+      if (failedIndices.length > 0) {
+        const warn = `第 ${failedIndices.map(i => i + 1).join('、')} 张图片识别失败（${failedImageNames.value.join('、')}），已跳过并合并其余结果`
+        errorMessage.value = errorMessage.value ? `${errorMessage.value}; ${warn}` : warn
       }
     } else {
-      processingStatus.value = processingStatus.value.map(() => 'error')
-      errorMessage.value = result.error || '批量识别失败'
+      errorMessage.value = result.error || '合并失败'
     }
   } catch (error) {
-    processingStatus.value = processingStatus.value.map(() => 'error')
     errorMessage.value = `请求失败: ${error}`
   } finally {
+    isMerging.value = false
     currentProcessingIndex.value = -1
     isLoading.value = false
   }
