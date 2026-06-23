@@ -26,6 +26,7 @@
           </svg>
           <p class="upload-text">点击或拖拽图片到此处</p>
           <p class="upload-hint">支持 JPG、PNG 格式</p>
+          <p class="upload-tip">提示：请尽量上传清晰的原图，模糊、反光或倾斜会导致漏识、错位，严重影响识别准确度</p>
         </div>
 
         <div v-else class="preview-grid">
@@ -45,7 +46,7 @@
         </div>
 
         <div v-if="isLoading" class="progress-bar-container">
-          <template v-if="crossPageMode && selectedFiles.length > 1">
+          <template v-if="selectedFiles.length > 1">
             <div class="progress-bar indeterminate"></div>
             <span class="progress-text">正在跨页识别合并...</span>
           </template>
@@ -62,30 +63,16 @@
       </div>
 
       <div v-if="previewImages.length > 0 && !isLoading" class="ocr-controls">
-        <div class="llm-toggle">
-          <label class="toggle-label">
-            <input type="checkbox" :checked="useLLMEnhancement" @change="onLLMToggleChange" />
-            <span class="toggle-slider"></span>
-            <span class="toggle-text">启用LLM智能增强</span>
-          </label>
-          <span class="toggle-hint">使用AI纠正识别错误，完善表格结构</span>
+        <div v-if="selectedFiles.length > 1" class="cross-page-hint">
+          已选择多张图片，将自动按顺序进行跨页合并识别
         </div>
 
-        <div v-if="selectedFiles.length > 1" class="llm-toggle">
-          <label class="toggle-label">
-            <input type="checkbox" v-model="crossPageMode" />
-            <span class="toggle-slider"></span>
-            <span class="toggle-text">跨页表格合并</span>
-          </label>
-          <span class="toggle-hint">同一表格跨越多页时，按顺序合并识别结果</span>
-        </div>
-        
         <button
           @click="startOcr"
           class="ocr-btn"
           :disabled="isLoading"
         >
-          {{ crossPageMode && selectedFiles.length > 1 ? (useLLMEnhancement ? '跨页智能合并' : '跨页合并识别') : (useLLMEnhancement ? '智能识别' : '开始识别') }}
+          {{ selectedFiles.length > 1 ? '跨页合并识别' : '开始识别' }}
         </button>
       </div>
     </div>
@@ -219,8 +206,6 @@ const isDragOver = ref(false)
 const isLoading = ref(false)
 const errorMessage = ref('')
 const fileInput = ref<HTMLInputElement>()
-const useLLMEnhancement = ref(false)
-const crossPageMode = ref(false)
 
 const selectedFiles = ref<File[]>([])
 const previewImages = ref<string[]>([])
@@ -325,19 +310,6 @@ const progressPercent = computed(() => {
   return selectedFiles.value.length > 0 ? (done / selectedFiles.value.length) * 100 : 0
 })
 
-// LLM增强开关切换确认
-const onLLMToggleChange = (event: Event) => {
-  const checked = (event.target as HTMLInputElement).checked
-  if (checked) {
-    const confirmed = confirm('LLM智能增强为测试功能，可能会产生错误识别结果，是否确认开启？')
-    if (!confirmed) {
-      ;(event.target as HTMLInputElement).checked = false
-      return
-    }
-  }
-  useLLMEnhancement.value = checked
-}
-
 // 开始OCR识别
 const startOcr = async () => {
   if (selectedFiles.value.length === 0) {
@@ -358,7 +330,7 @@ const startOcr = async () => {
   splitTables.value = []
   isSplit.value = false
 
-  if (crossPageMode.value && selectedFiles.value.length > 1) {
+  if (selectedFiles.value.length > 1) {
     await startCrossPageOcr()
   } else {
     await startParallelOcr()
@@ -391,7 +363,7 @@ const startParallelOcr = async () => {
     const formData = new FormData()
     formData.append('file', file)
     const baseUrl = import.meta.env.VITE_API_BASE_URL || ''
-    const url = `${baseUrl}/api/ocr?enhance=${useLLMEnhancement.value}`
+    const url = `${baseUrl}/api/ocr?enhance=false`
     try {
       const res = await fetch(url, { method: 'POST', body: formData })
       if (!res.ok) {
@@ -480,7 +452,7 @@ const startCrossPageOcr = async () => {
   })
 
   const baseUrl = import.meta.env.VITE_API_BASE_URL || ''
-  const url = `${baseUrl}/api/ocr-batch?enhance=${useLLMEnhancement.value}`
+  const url = `${baseUrl}/api/ocr-batch?enhance=false`
 
   try {
     const response = await fetch(url, { method: 'POST', body: formData })
@@ -591,7 +563,7 @@ const exportSingleTableCsv = (tableIndex: number) => {
 
 .upload-area:hover,
 .upload-area.drag-over {
-  border-color: #4CAF50;
+  border-color: #97c5ec;
   background: #f0f8f0;
 }
 
@@ -622,6 +594,17 @@ const exportSingleTableCsv = (tableIndex: number) => {
   font-size: 0.9rem;
   color: #999;
   margin: 0;
+}
+
+.upload-tip {
+  font-size: 0.85rem;
+  color: #8a6d3b;
+  background: #fff8e1;
+  border: 1px solid #ffe082;
+  border-radius: 4px;
+  padding: 0.5rem 0.75rem;
+  margin: 0;
+  max-width: 90%;
 }
 
 .preview-grid {
@@ -901,6 +884,14 @@ const exportSingleTableCsv = (tableIndex: number) => {
   display: flex;
   flex-direction: column;
   gap: 1rem;
+}
+
+.cross-page-hint {
+  font-size: 0.85rem;
+  color: #1565c0;
+  background: #e3f2fd;
+  border-radius: 4px;
+  padding: 0.5rem 0.75rem;
 }
 
 .llm-toggle {

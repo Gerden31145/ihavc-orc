@@ -9,10 +9,11 @@ import asyncio
 import httpx
 import uvicorn
 import logging
+from pathlib import Path
 from llm_enhancer import LLMEnhancer
 from table_splitter import split_table_by_repeated_headers, merge_split_results
 from cross_page_merger import merge_cross_page_tables
-from ocr_postprocess import repair_table_structure, split_parallel_tables
+from ocr_postprocess import repair_table_structure, split_parallel_tables, merge_wrap_continuations
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -275,6 +276,8 @@ async def run_table_recognition_pipeline(image_data):
             idx = ocr_text.index('园林')
             logger.info(f"[DEBUG] 园林 in raw OCR at pos {idx}: ...{ocr_text[max(0,idx-50):idx+200]}...")
     matrix = parse_table_text_to_matrix(ocr_text) if ocr_text else None
+    # 保留原始解析矩阵(拆分/合并/修复之前), 供批处理调试 dump
+    raw_matrix = [list(r) for r in matrix] if matrix else None
 
     # 表格结构修复：拆分粘连表头、粘连数字等
     repair_corrections = []
@@ -286,6 +289,16 @@ async def run_table_recognition_pipeline(image_data):
         repair_corrections.extend(split_corrections)
         if split_corrections:
             logger.info(f"[DEBUG] 并排表格拆分: {split_corrections[0]['corrected']}")
+
+        # 换行续行合并: 长"招生院校(专业)"折行时, GLM 会补一行 [空序号 + 名字尾部片段]
+        # 的 artifact, 单独成行会显示成错位的"名字碎片行"。仅在单表(未触发并排拆分且
+        # 列数 <= 8)上做 —— 并排未拆分的宽表(>=10 列)里块 A 的片段与块 B 的真实条目同处
+        # 一行, 合并/丢弃会误删块 B 数据, 故跳过(拆分触发的页已在 split 内部按块合并)。
+        if matrix and not split_corrections and len(matrix[0]) <= 8:
+            matrix, wrap_corrections = merge_wrap_continuations(matrix)
+            repair_corrections.extend(wrap_corrections)
+            if wrap_corrections:
+                logger.info(f"[DEBUG] 换行续行合并: {len(wrap_corrections)} 项")
 
         logger.info(f"[DEBUG] repair 前 headers: {matrix[0] if matrix else 'N/A'}")
         for i, row in enumerate(matrix[:4]):
@@ -307,6 +320,7 @@ async def run_table_recognition_pipeline(image_data):
     meta = {
         "source_engine": "glm-ocr",
         "repair_corrections": repair_corrections,
+        "raw_matrix": raw_matrix,
     }
     return matrix, meta
 
@@ -477,6 +491,7 @@ async def ocr_batch(files: List[UploadFile] = File(...), enhance: bool = True):
         # 实测：并发 5 为最优——超过后单图延迟从 ~29s 飙升到 47-64s，总耗时反而更长
         OCR_CONCURRENCY = 5
         page_matrices: List[list | None] = [None] * len(images)
+        page_raw_matrices: List[list | None] = [None] * len(images)
         all_repair_corrections: list = []
         semaphore = asyncio.Semaphore(OCR_CONCURRENCY)
         progress_lock = asyncio.Lock()
@@ -488,6 +503,7 @@ async def ocr_batch(files: List[UploadFile] = File(...), enhance: bool = True):
                 logger.info(f"批量OCR: 正在处理第{idx+1}/{len(images)}张图片")
                 matrix, page_meta = await run_table_recognition_pipeline(img_data)
                 page_matrices[idx] = matrix
+                page_raw_matrices[idx] = page_meta.get("raw_matrix")
                 async with progress_lock:
                     done_count += 1
                     logger.info(f"批量OCR: 已完成 {done_count}/{len(images)}")
@@ -512,6 +528,20 @@ async def ocr_batch(files: List[UploadFile] = File(...), enhance: bool = True):
         rows = merged["rows"]
         diagnostics = merged["merge_diagnostics"]
         logger.info(f"[DEBUG] merged: headers={headers}, total_rows={len(rows)}, diagnostics={diagnostics}")
+
+        # 调试 dump: 每页原始矩阵(拆分前) + 流水线矩阵(拆分后) + 合并结果, UTF-8
+        try:
+            import json as _json
+            Path("debug_batch.json").write_text(_json.dumps({
+                "page_raw_matrices": page_raw_matrices,
+                "page_pipe_matrices": page_matrices,
+                "merged_headers": headers,
+                "merged_rows": rows,
+                "merge_diagnostics": diagnostics,
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+            logger.info("[DEBUG] 已写入 debug_batch.json (raw+pipe+merged)")
+        except Exception as _e:
+            logger.warning(f"[DEBUG] debug_batch.json 写入失败: {_e}")
         if rows:
             for i in range(min(3, len(rows))):
                 logger.info(f"[DEBUG] merged row[{i}]: {rows[i]}")

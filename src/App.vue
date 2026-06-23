@@ -5,7 +5,7 @@ import OcrTable from './components/OcrTable.vue'
 <template>
   <div class="app">
     <header class="app-header">
-      <h1>🎓 高考分数线 OCR 提取工具</h1>
+      <h1>高考分数线 OCR 提取工具</h1>
       <p>上传表格图片，自动识别并导出数据</p>
     </header>
 
@@ -14,7 +14,7 @@ import OcrTable from './components/OcrTable.vue'
     </main>
 
     <footer class="app-footer">
-      <p>基于百度OCR API | Vue 3 + FastAPI</p>
+      <p></p>
     </footer>
   </div>
 </template>
@@ -24,7 +24,7 @@ import OcrTable from './components/OcrTable.vue'
   min-height: 100vh;
   display: flex;
   flex-direction: column;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  background-color: rgb(20, 29, 33);
 }
 
 .app-header {

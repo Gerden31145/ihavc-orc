@@ -338,7 +338,10 @@ def split_parallel_tables(
     body = table[header_idx + 1:]
     new_rows: List[List[str]] = [list(block)]
     dropped = 0
+    wrap_corrections: List[Dict[str, str]] = []
     for col in range(k):
+        # 收集这一列(并排表之一)的所有行 chunk: 块表头 + 数据行
+        col_rows: List[List[str]] = [list(block)]
         for row in body:
             chunk = list(row[col * n:(col + 1) * n])
             while len(chunk) < n:
@@ -347,16 +350,164 @@ def split_parallel_tables(
                 if any(normalize_cell_text(c) for c in chunk):
                     dropped += 1
                 continue
-            new_rows.append(chunk)
+            col_rows.append(chunk)
+        # 块内部合并换行续行(空序号的名字片段)。在块内做, 避免并排两表 A/B 互相串位。
+        merged_block, wcorr = merge_wrap_continuations(col_rows)
+        dropped += len(col_rows) - len(merged_block)
+        wrap_corrections.extend(wcorr)
+        new_rows.extend(merged_block[1:])  # 跳过块表头, 只追加数据行
 
     corrections: List[Dict[str, str]] = [{
         "original": f"{len(table)} rows x {len(table[0]) if table else 0} cols "
                     f"(K={k} side-by-side same-header tables)",
         "corrected": f"split column-major into {n}-col table, "
-                     f"{len(new_rows) - 1} data rows ({dropped} fragment rows dropped)",
+                     f"{len(new_rows) - 1} data rows ({dropped} fragment/wrap rows dropped)",
         "reason": "split side-by-side same-header tables into stacked rows",
     }]
+    corrections.extend(wrap_corrections)
     return new_rows, corrections
+
+
+def _name_paren_balance(name: str) -> int:
+    """(开括号数) - (闭括号数)。>0: 名字被截断(有未闭合括号); <0: 多余闭括号(续行片段)。"""
+    name = name or ""
+    open_count = name.count("(") + name.count("（")
+    close_count = name.count(")") + name.count("）")
+    return open_count - close_count
+
+
+def _is_name_fragment(name: str) -> bool:
+    """是否像换行续行的"名字片段"(而非完整专业名)。
+    信号:
+      - 闭括号多于开括号(纯尾部, 如 '校区)'、'实验班)');
+      - 平衡的括号注释且较短(如 '(广州番禺校区)'、'(中外合作办学)');
+      - 极短(<=4)且以右括号/顿号等结尾。
+    完整专业名(如 '数学与应用数学(基地班)' 括号平衡且不以 '(' 开头)不会被误判。"""
+    name = normalize_cell_text(name)
+    if not name:
+        return False
+    if _name_paren_balance(name) < 0:
+        return True
+    if name[:1] in "(（" and name[-1:] in ")）" and len(name) <= 14:
+        return True
+    if len(name) <= 4 and name[-1] in ")），、。；】":
+        return True
+    return False
+
+
+def _is_balanced_note(name: str) -> bool:
+    """是否为平衡的括号注释(如 '(广州番禺校区)'), 可作为修饰安全追加到完整父名。"""
+    name = normalize_cell_text(name)
+    return bool(name) and name[:1] in "(（" and name[-1:] in ")）" and _name_paren_balance(name) == 0
+
+
+def merge_wrap_continuations(
+    table: List[List[str]],
+) -> Tuple[List[List[str]], List[Dict[str, str]]]:
+    """合并换行续行产生的 artifact 行。
+
+    长"招生院校(专业)"在图上折行时, GLM-OCR 会把折下的尾部单独补成一行
+    [空序号, 名字尾部片段, ...(数据, 通常为空或与父行重复)]。这种行单独留在表里
+    会显示成"只有一个名字碎片"的错位行(用户反馈的"换行文本成了新的一行")。
+
+    本函数只处理**安全**情形, 其余一律不动, 以保证已有识别的正确性:
+
+      (a) 父行名字被截断(有未闭合括号, 如 '木材科学与工程(一、二年级') 且续行是
+          名字尾 -> 把尾部并回父行名字, 丢弃续行; 父行数据全空时用续行数据回填。
+      (b) 父名已包含该尾部(冗余) -> 丢弃续行。
+      (c1) 续行是平衡括号注释(如 '(广州番禺校区)') 且数据与父行一致(同一词条折行)
+          -> 注释追加到父名, 丢弃续行。
+      (c2) 续行数据与父行不一致(疑似另一条目名字丢失后的残片) -> 仅丢弃, 不误并到
+          父行, 避免把别的条目的数据/校区注释错误归到当前条目。
+
+    真实条目(完整或空的名字, 缺序号)与找不到父行的孤儿片段均不触碰。返回 (新表, corrections)。
+    """
+    corrections: List[Dict[str, str]] = []
+    if not table or len(table) < 2:
+        return table, corrections
+
+    header = list(table[0])
+    body = [list(r) for r in table[1:]]
+    drop = [False] * len(body)
+
+    def cell(row: List[str], i: int) -> str:
+        return normalize_cell_text(row[i]) if i < len(row) else ""
+
+    for i in range(len(body)):
+        row = body[i]
+        if cell(row, 0):
+            continue  # 序号非空 -> 不是续行
+        name_r = cell(row, 1)
+        if not _is_name_fragment(name_r):
+            continue  # 名字不是片段 -> 可能是真实条目(缺序号), 不动
+
+        # 扫描回溯到最近一个"有序号且未被丢弃"的父行
+        parent_idx = None
+        for k in range(i - 1, -1, -1):
+            if drop[k]:
+                continue
+            if cell(body[k], 0):
+                parent_idx = k
+                break
+        if parent_idx is None:
+            continue  # 页首孤儿(跨页头丢失) -> 不动
+
+        pname = cell(body[parent_idx], 1)
+        rdata = [cell(row, c) for c in range(2, len(row))]
+        pdata = [cell(body[parent_idx], c) for c in range(2, len(body[parent_idx]))]
+        r_has_data = any(rdata)
+        # 续行数据是否与父行一致(为空或等于父行): 一致才说明是同一词条折行
+        rdata_matches = all((not rd) or (pd and rd == pd) for rd, pd in zip(rdata, pdata))
+
+        # 情形(a): 父名被截断(开括号多) -> 并回尾部
+        if _name_paren_balance(pname) > 0 and name_r and name_r not in pname:
+            body[parent_idx][1] = pname + name_r
+            if not any(pdata) and r_has_data:
+                for c in range(2, len(row)):
+                    if c < len(body[parent_idx]):
+                        body[parent_idx][c] = row[c]
+            drop[i] = True
+            corrections.append({
+                "original": f"续行 '{name_r}' 单独成行",
+                "corrected": f"并入上一行名字 -> '{body[parent_idx][1]}'",
+                "reason": "合并换行续行(父名被截断, 补全尾部)",
+            })
+            continue
+
+        # 情形(b): 父名已含该尾部 -> 冗余, 丢弃续行
+        if len(name_r) >= 2 and name_r in pname:
+            drop[i] = True
+            corrections.append({
+                "original": f"续行 '{name_r}' 单独成行",
+                "corrected": "丢弃(父名已包含该尾部, 冗余)",
+                "reason": "合并换行续行(冗余 artifact)",
+            })
+            continue
+
+        # 情形(c1): 平衡括号注释 + 数据与父行一致(同一词条折行) -> 追加注释到父名
+        if rdata_matches and _is_balanced_note(name_r) and name_r not in pname:
+            body[parent_idx][1] = pname + name_r
+            drop[i] = True
+            corrections.append({
+                "original": f"续行 '{name_r}' 单独成行",
+                "corrected": f"追加注释到上一行名字 -> '{body[parent_idx][1]}'",
+                "reason": "合并换行续行(同条折行, 追加修饰注释)",
+            })
+            continue
+
+        # 情形(c2): 数据不一致 -> 疑似另一条目名字丢失后的残片, 仅丢弃不误并
+        drop[i] = True
+        corrections.append({
+            "original": f"续行 '{name_r}' 单独成行",
+            "corrected": "丢弃(数据与父行不一致, 疑似残片, 不误并)",
+            "reason": "合并换行续行(丢弃不可归属残片)",
+        })
+
+    if not any(drop):
+        return table, corrections
+
+    new_body = [r for r, d in zip(body, drop) if not d]
+    return [header] + new_body, corrections
 
 
 def _flatten_multirow_headers(table: List[List[str]], corrections: List[Dict[str, str]]) -> List[List[str]]:
